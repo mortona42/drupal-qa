@@ -1,0 +1,61 @@
+{
+    "$schema": "https://raw.githubusercontent.com/streetsidesoftware/cspell/main/cspell.schema.json",
+    "version": "0.2",
+    "description": "Fallback CSpell configuration for Drupal projects, based on the default that Drupal's GitLab CI templates use for contrib. drupal-qa generates an overlay that adds core's dictionaries and the project's own word list when those exist.",
+    "language": "en-US",
+    "allowCompoundWords": false,
+    "minWordLength": 4,
+    "ignorePaths": [
+        "**/node_modules/**",
+        "**/vendor/**",
+        "**/*.min.js",
+        "**/*.min.css",
+        "**/dist/**",
+        "**/build/**",
+        "composer.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "**/LICENSE.txt",
+        "**/*.png",
+        "**/*.jpg",
+        "**/*.gif",
+        "**/*.svg",
+        "**/*.woff",
+        "**/*.woff2"
+    ],
+    "ignoreRegExpList": [
+        "^msgstr .*",
+        "!!binary .*",
+        "%[0-9][0-9A-F]",
+        "\\Wi18n",
+        "\\x{[0-9A-F]{4,5}}"
+    ],
+    "dictionaries": [
+        "companies",
+        "css",
+        "filetypes",
+        "fonts",
+        "html",
+        "node",
+        "php",
+        "softwareTerms",
+        "typescript"
+    ],
+    "flagWords": [
+        "blacklist->blocklist, denylist",
+        "blacklists->blocklists, denylists",
+        "blacklisted->blocklisted, denylisted",
+        "e-mail",
+        "grey",
+        "queuing",
+        "whitelist->allowlist",
+        "whitelists->allowlists",
+        "whitelisted->allowlisted"
+    ],
+    "overrides": [
+        {
+            "filename": "**/{*.engine,*.inc,*.install,*.module,*.profile,*.theme}",
+            "languageId": "php"
+        }
+    ]
+}

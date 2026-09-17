@@ -1,0 +1,7 @@
+# ShellCheck cannot follow `source "$QA_LIB/..."` because the path is a runtime
+# variable, so it checks each library in isolation. The CLI is one program split
+# across files: options parsed in bin/drupal-qa are read by bin/lib/*.sh, and
+# config.sh sets QA_CONFIG_ORIGIN for tools.sh to print. Both look like dead
+# assignments from inside a single file.
+disable=SC1091,SC2034
+external-sources=true

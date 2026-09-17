@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+#
+# drupal-qa - run Drupal's CI code quality tools and tests locally.
+#
+# Design notes for anyone reading this later:
+#
+#  * Zero configuration is the default. A module with no config files still gets
+#    linted with exactly the rules its GitLab pipeline would use, because the
+#    fallbacks come from Drupal core and the CI templates rather than from
+#    something invented here.
+#  * Nothing is installed into the user's project. The QA toolchain lives in the
+#    Nix store; the project's composer.json is never touched, which matters
+#    because composer-lint checks that very file.
+#  * Every command prints what it is about to run and where its config came
+#    from, and ends with one summary. A tool you cannot see into is a tool you
+#    stop trusting the first time it disagrees with CI.
+
+set -uo pipefail
+
+# Colour is decided before common.sh computes the escape sequences, so
+# --no-color has to be honoured here rather than during normal option parsing.
+for _arg in "$@"; do
+  case $_arg in
+    --no-color|--no-colour) DRUPAL_QA_COLOR=never ;;
+  esac
+done
+unset _arg
+export DRUPAL_QA_COLOR="${DRUPAL_QA_COLOR:-auto}"
+
+QA_SELF=${BASH_SOURCE[0]}
+QA_SELF_DIR=$(cd "$(dirname "$(readlink -f "$QA_SELF")")" && pwd)
+QA_LIB=${DRUPAL_QA_LIB:-$QA_SELF_DIR/lib}
+
+# shellcheck source=lib/common.sh
+source "$QA_LIB/common.sh"
+# shellcheck source=lib/config.sh
+source "$QA_LIB/config.sh"
+# shellcheck source=lib/tools.sh
+source "$QA_LIB/tools.sh"
+# shellcheck source=lib/test.sh
+source "$QA_LIB/test.sh"
+# shellcheck source=lib/ci.sh
+source "$QA_LIB/ci.sh"
+# shellcheck source=lib/ddev.sh
+source "$QA_LIB/ddev.sh"
+# shellcheck source=lib/init.sh
+source "$QA_LIB/init.sh"
+
+QA_VERSION=${DRUPAL_QA_VERSION:-dev}
+QA_INIT_WHAT=()
+
+usage() {
+  cat <<EOF
+${C_BOLD}drupal-qa${C_RESET} $QA_VERSION - Drupal code quality tools and tests, without the setup
+
+${C_BOLD}USAGE${C_RESET}
+  drupal-qa <command> [target] [options]
+
+  ${C_DIM}target is a path, or a module/theme machine name resolved inside the
+  detected Drupal root. Omit it to use the current directory.${C_RESET}
+
+${C_BOLD}CHECKING${C_RESET}
+  lint [target]           Run every static check that applies to the target
+  fix [target]            Run every auto-fixer (phpcbf, eslint --fix, prettier, twig --fix)
+  phpcs / phpcbf          Drupal coding standards
+  phpstan                 Static analysis, Drupal-aware
+  cspell                  Spell check, using core's dictionaries
+  eslint / stylelint      JavaScript, YAML and CSS
+  prettier                Formatting
+  twig                    Twig CS Fixer
+  php-lint                PHP syntax only (fast)
+  composer-lint           composer validate
+
+${C_BOLD}TESTING${C_RESET}
+  test [target]           PHPUnit. Stands up SQLite, a web server and a headless
+                          browser as needed - no environment variables required
+  nightwatch [target]     Core's Nightwatch suite
+
+${C_BOLD}PIPELINE${C_RESET}
+  ci [job...]             Run the real GitLab pipeline locally (gitlab-ci-local)
+  ci --list               Show the jobs the pipeline defines
+
+${C_BOLD}SETUP${C_RESET}
+  init [target]           Write QA config into a module/theme/profile
+  baseline [target]       Accept today's PHPStan errors, fail only on new ones
+  info [target]           Show everything that was detected, and why
+  doctor                  Check the environment and report what is missing
+
+${C_BOLD}COMMON OPTIONS${C_RESET}
+  --changed[=<ref>]       Only files changed since <ref> (default: merge-base
+                          with the upstream branch). The way to make an
+                          inherited codebase reviewable.
+  --fix                   Let fixable tools fix instead of report
+  --php=<8.3|8.4|8.5>     PHP version to run tools under (default: ${DRUPAL_QA_PHP_DEFAULT:-8.3})
+  --core=<path>           Drupal root, when it cannot be found automatically
+  --config-source=<src>   auto (default) | project | core | bundled
+  --level=<n>             PHPStan level override
+  --format=<fmt>          pretty (default) | junit | gitlab | json
+  --report-dir=<path>     Where machine-readable reports are written
+  --only=<a,b>            Restrict 'lint'/'fix' to these tools
+  --skip=<a,b>            Exclude these tools from 'lint'/'fix'
+  -v, --verbose           Show the exact command behind every tool
+  --show-commands         Show commands without the rest of the verbose output
+  -q, --quiet             Suppress the per-command echo
+  --no-color              Disable colour
+
+${C_BOLD}TEST OPTIONS${C_RESET}
+  --type=<list>           unit,kernel,functional,functional-js,build
+  --group=<name>          PHPUnit @group
+  --filter=<regex>        PHPUnit --filter
+  --db=<sqlite|mysql|pgsql>  Database for tests (default: sqlite)
+  --db-url=<url>          Explicit SIMPLETEST_DB
+  --ddev                  Borrow DDEV's database and URL (tools still run on the
+                          host, at host speed)
+  --coverage[=pcov|xdebug]  Generate coverage
+  --xdebug                Enable step debugging
+  --stop-on-failure
+  --deprecations          Show deprecation details (hidden by default: a contrib
+                          run reports dozens triggered by core itself)
+  --keep                  Keep scratch files and browser output
+
+${C_BOLD}INIT OPTIONS${C_RESET}
+  --with=<list>           phpcs,phpstan,cspell,eslint,stylelint,prettier,
+                          editorconfig,gitattributes,gitignore,gitlab-ci,ddev,envrc
+  --gitlab-ci             Shorthand for --with=gitlab-ci
+  --force                 Overwrite files that already exist
+
+${C_BOLD}EXAMPLES${C_RESET}
+  drupal-qa lint                          ${C_DIM}# the module you are standing in${C_RESET}
+  drupal-qa lint my_module                ${C_DIM}# by machine name, from anywhere${C_RESET}
+  drupal-qa lint --changed                ${C_DIM}# only what you touched${C_RESET}
+  drupal-qa fix --changed                 ${C_DIM}# and fix it${C_RESET}
+  drupal-qa phpstan web/modules/custom --level=2
+  drupal-qa test my_module --type=kernel
+  drupal-qa test my_module --type=functional-js --ddev
+  drupal-qa ci phpcs                      ${C_DIM}# the actual CI job, in its container${C_RESET}
+  drupal-qa init my_module --with=phpcs,phpstan,gitlab-ci
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+QA_COMMAND=""
+QA_TARGET=""
+QA_PASSTHROUGH=()
+
+# Most options are consumed by functions in the sourced libraries, so
+# ShellCheck cannot see their use from here.
+# shellcheck disable=SC2034
+parse_args() {
+  local -a rest=()
+  while [[ $# -gt 0 ]]; do
+    local arg=$1
+    case $arg in
+      -h|--help)        usage; exit 0 ;;
+      -V|--version)     printf 'drupal-qa %s\n' "$QA_VERSION"; exit 0 ;;
+      -v|--verbose)     QA_VERBOSE=1 ;;
+      -q|--quiet)       QA_SHOW_COMMANDS=0; QA_VERBOSE=0 ;;
+      --show-commands)  QA_SHOW_COMMANDS=1 ;;
+      --no-color|--no-colour) ;;  # handled before the libraries were sourced
+      --fix)            QA_FIX=1 ;;
+      --force)          QA_FORCE=1 ;;
+      --keep)           QA_KEEP_ARTIFACTS=1 ;;
+      --ddev)           QA_USE_DDEV=1 ;;
+      --no-ddev)        QA_USE_DDEV=0 ;;
+      --xdebug)         QA_XDEBUG=1 ;;
+      --stop-on-failure) QA_TEST_STOP=1 ;;
+      --deprecations)   QA_SHOW_DEPRECATIONS=1 ;;
+      --deprecations=*) QA_SHOW_DEPRECATIONS=$([[ "${arg#*=}" == "show" ]] && echo 1 || echo 0) ;;
+      --accept-words)   QA_ACCEPT_WORDS=1 ;;
+      --gitlab-ci)      QA_INIT_WHAT+=(gitlab-ci) ;;
+      --offline)        QA_OFFLINE=1 ;;
+      --dirty)          QA_CI_DIRTY=1 ;;
+      --list)           QA_LIST=1 ;;
+
+      --changed)        QA_CHANGED=1 ;;
+      --changed=*)      QA_CHANGED=1; QA_CHANGED_REF=${arg#*=} ;;
+      --coverage)       QA_COVERAGE_DRIVER=pcov ;;
+      --coverage=*)     QA_COVERAGE_DRIVER=${arg#*=} ;;
+
+      --php=*)          QA_PHP_VERSION=${arg#*=} ;;
+      --php)            shift; QA_PHP_VERSION=$1 ;;
+      --core=*)         QA_CORE_OVERRIDE=${arg#*=} ;;
+      --core)           shift; QA_CORE_OVERRIDE=$1 ;;
+      --config-source=*) QA_CONFIG_SOURCE=${arg#*=} ;;
+      --level=*)        QA_PHPSTAN_LEVEL=${arg#*=} ;;
+      --format=*)       QA_FORMAT=${arg#*=} ;;
+      --report-dir=*)   QA_REPORT_DIR=${arg#*=} ;;
+      --only=*)         QA_ONLY=${arg#*=} ;;
+      --skip=*)         QA_SKIP=${arg#*=} ;;
+      --type=*)         QA_TEST_TYPES=${arg#*=} ;;
+      --group=*)        QA_TEST_GROUP=${arg#*=} ;;
+      --filter=*)       QA_TEST_FILTER=${arg#*=} ;;
+      --db=*)           QA_DB=${arg#*=} ;;
+      --db-url=*)       QA_DB_URL=${arg#*=}; QA_DB=external ;;
+      --with=*)         IFS=, read -ra _w <<< "${arg#*=}"; QA_INIT_WHAT+=("${_w[@]}") ;;
+      --templates-ref=*) QA_TEMPLATES_REF=${arg#*=} ;;
+
+      # Escape hatches: anything after these goes straight to the tool. There is
+      # always a flag we did not think of.
+      --phpcs-args=*)    QA_EXTRA_PHPCS=${arg#*=} ;;
+      --phpstan-args=*)  QA_EXTRA_PHPSTAN=${arg#*=} ;;
+      --phpunit-args=*)  QA_EXTRA_PHPUNIT=${arg#*=} ;;
+      --eslint-args=*)   QA_EXTRA_ESLINT=${arg#*=} ;;
+      --stylelint-args=*) QA_EXTRA_STYLELINT=${arg#*=} ;;
+      --cspell-args=*)   QA_EXTRA_CSPELL=${arg#*=} ;;
+      --twig-args=*)     QA_EXTRA_TWIG=${arg#*=} ;;
+      --ci-args=*)       QA_EXTRA_CI=${arg#*=} ;;
+      --)               shift; QA_PASSTHROUGH+=("$@"); break ;;
+
+      -*)               die "Unknown option '$arg'. See 'drupal-qa --help'." ;;
+      *)                rest+=("$arg") ;;
+    esac
+    shift
+  done
+
+  [[ ${#rest[@]} -gt 0 ]] && QA_COMMAND=${rest[0]}
+  [[ ${#rest[@]} -gt 1 ]] && QA_TARGET=${rest[1]}
+  [[ ${#rest[@]} -gt 2 ]] && QA_PASSTHROUGH+=("${rest[@]:2}")
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# lint / fix orchestration
+# ---------------------------------------------------------------------------
+
+ALL_LINT_TOOLS=(php-lint composer phpcs phpstan cspell eslint stylelint twig)
+ALL_FIX_TOOLS=(phpcbf prettier eslint stylelint twig)
+
+wanted() {
+  local tool=$1
+  if [[ -n "${QA_ONLY:-}" ]]; then
+    [[ ",$QA_ONLY," == *",$tool,"* ]] || return 1
+  fi
+  if [[ -n "${QA_SKIP:-}" ]]; then
+    [[ ",$QA_SKIP," == *",$tool,"* ]] && return 1
+  fi
+  return 0
+}
+
+dispatch_tool() {
+  case $1 in
+    php-lint)   tool_php_lint ;;
+    composer|composer-lint) tool_composer_lint ;;
+    phpcs)      tool_phpcs ;;
+    phpcbf)     tool_phpcbf ;;
+    phpstan)    tool_phpstan ;;
+    cspell)     tool_cspell ;;
+    eslint)     tool_eslint ;;
+    stylelint)  tool_stylelint ;;
+    prettier)   tool_prettier ;;
+    twig)       tool_twig ;;
+    *)          die "Unknown tool '$1'." ;;
+  esac
+}
+
+cmd_lint() {
+  local t
+  for t in "${ALL_LINT_TOOLS[@]}"; do
+    wanted "$t" && dispatch_tool "$t"
+  done
+}
+
+cmd_fix() {
+  QA_FIX=1
+  local t
+  for t in "${ALL_FIX_TOOLS[@]}"; do
+    wanted "$t" && dispatch_tool "$t"
+  done
+  log ""
+  info "Fixers have run. Review the diff, then check what is left: drupal-qa lint ${QA_TARGET_ARG:-.}"
+}
+
+# ---------------------------------------------------------------------------
+# info / doctor
+# ---------------------------------------------------------------------------
+
+row() { printf '  %s%-22s%s %s\n' "$C_DIM" "$1" "$C_RESET" "${2:-—}" >&2; }
+
+cmd_info() {
+  printf '\n%sEnvironment%s\n' "$C_BOLD" "$C_RESET" >&2
+  row "drupal-qa" "$QA_VERSION"
+  row "PHP" "$($(resolve_php) -r 'echo PHP_VERSION;' 2>/dev/null) ($(resolve_php))"
+  row "Node" "$("${DRUPAL_QA_NODE:-node}" --version 2>/dev/null)"
+  row "PHP toolbox" "$(php_toolbox_vendor 2>/dev/null || echo 'not found')"
+  row "Node toolbox" "${DRUPAL_QA_NODE_TOOLBOX:-not set}"
+  row "Cache" "$(cache_dir)"
+
+  printf '\n%sProject%s\n' "$C_BOLD" "$C_RESET" >&2
+  row "target" "$QA_TARGET_PATH"
+  row "project root" "$QA_PROJECT_ROOT"
+  row "project name" "$QA_PROJECT_NAME"
+  row "project type" "$QA_PROJECT_TYPE"
+  row "git root" "${QA_GIT_ROOT:-none}"
+  row "Drupal root" "${QA_DRUPAL_ROOT:-not found}"
+  row "core version" "${QA_CORE_VERSION:-unknown}"
+  row "composer root" "${QA_COMPOSER_ROOT:-none}"
+  row "vendor/bin" "${QA_COMPOSER_BIN_DIR:-none}"
+  row "DDEV project" "${QA_DDEV_ROOT:-none}"
+  if ddev_available; then
+    row "DDEV status" "$(ddev_running && echo running || echo stopped)"
+  fi
+
+  printf '\n%sContent%s\n' "$C_BOLD" "$C_RESET" >&2
+  row "PHP files" "$(has_files_with_ext "$PHP_EXTS" && echo yes || echo no)"
+  row "JS / YAML files" "$(has_files_with_ext "$JS_EXTS" && echo yes || echo no)"
+  row "CSS files" "$(has_files_with_ext "$CSS_EXTS" && echo yes || echo no)"
+  row "Twig files" "$(has_files_with_ext "$TWIG_EXTS" && echo yes || echo no)"
+  row "tests/" "$([[ -d "$QA_PROJECT_ROOT/tests" ]] && echo yes || echo no)"
+
+  printf '\n%sConfiguration that will be used%s\n' "$C_BOLD" "$C_RESET" >&2
+  # Called with stdout redirected rather than in $(...), so that the provenance
+  # the function records stays visible in this shell.
+  local label fn
+  for label in phpcs phpstan cspell eslint stylelint prettier twig; do
+    fn="config_${label}"
+    QA_CONFIG_ORIGIN=""; QA_CONFIG_FILE=""
+    "$fn" > /dev/null
+    if [[ "${QA_VERBOSE:-0}" == "1" ]]; then
+      row "$label" "$QA_CONFIG_ORIGIN"
+      printf '  %-22s %s%s%s\n' "" "$C_DIM" "$QA_CONFIG_FILE" "$C_RESET" >&2
+    else
+      row "$label" "$QA_CONFIG_ORIGIN"
+    fi
+  done
+  printf '\n  %sRe-run with -v to see the resolved file paths.%s\n\n' "$C_DIM" "$C_RESET" >&2
+}
+
+check() {
+  local label=$1 status=$2 detail=${3:-}
+  local mark colour
+  case $status in
+    ok)   mark='ok  '; colour=$C_GREEN ;;
+    warn) mark='warn'; colour=$C_YELLOW ;;
+    *)    mark='FAIL'; colour=$C_RED ;;
+  esac
+  printf '  %s%s%s %-26s %s%s%s\n' "$colour" "$mark" "$C_RESET" "$label" "$C_DIM" "$detail" "$C_RESET" >&2
+}
+
+cmd_doctor() {
+  local problems=0
+  printf '\n%sToolchain%s\n' "$C_BOLD" "$C_RESET" >&2
+
+  local php; php=$(resolve_php)
+  if [[ -x "$php" ]]; then
+    check "PHP" ok "$("$php" -r 'echo PHP_VERSION;')"
+    local ext missing=""
+    for ext in dom gd mbstring pdo_sqlite simplexml tokenizer xml; do
+      "$php" -m 2>/dev/null | grep -qix "$ext" || missing+=" $ext"
+    done
+    if [[ -n "$missing" ]]; then
+      check "PHP extensions" fail "missing:$missing"
+      problems=$((problems + 1))
+    else
+      check "PHP extensions" ok "all Drupal requirements present"
+    fi
+  else
+    check "PHP" fail "not found"; problems=$((problems+1))
+  fi
+
+  local t
+  for t in phpcs phpcbf phpstan parallel-lint twig-cs-fixer; do
+    if php_tool "$t" >/dev/null 2>&1; then check "$t" ok "$(php_tool "$t")"
+    else check "$t" fail "not found"; problems=$((problems+1)); fi
+  done
+  for t in eslint stylelint prettier cspell; do
+    if node_tool "$t" >/dev/null 2>&1; then check "$t" ok "$(node_tool "$t")"
+    else check "$t" fail "not found"; problems=$((problems+1)); fi
+  done
+
+  printf '\n%sOptional%s\n' "$C_BOLD" "$C_RESET" >&2
+  for t in composer git jq gitlab-ci-local chromedriver docker ddev; do
+    if command -v "$t" >/dev/null 2>&1; then
+      check "$t" ok "$(command -v "$t")"
+    else
+      case $t in
+        composer|git|jq) check "$t" fail "not found"; problems=$((problems+1)) ;;
+        docker)       check "$t" warn "needed only for 'drupal-qa ci'" ;;
+        ddev)         check "$t" warn "needed only for --ddev" ;;
+        chromedriver) check "$t" warn "needed only for FunctionalJavascript tests" ;;
+        *)            check "$t" warn "needed only for 'drupal-qa ci'" ;;
+      esac
+    fi
+  done
+
+  # Environment checks that only make sense against a real project.
+  if [[ "${QA_OFFLINE:-0}" != "1" ]]; then
+    printf '\n%sProject%s\n' "$C_BOLD" "$C_RESET" >&2
+    if [[ -n "${QA_DRUPAL_ROOT:-}" ]]; then
+      check "Drupal root" ok "$QA_DRUPAL_ROOT (${QA_CORE_VERSION:-unknown version})"
+    else
+      check "Drupal root" warn "not found; PHPStan and tests will be limited"
+    fi
+    if [[ -n "${QA_COMPOSER_ROOT:-}" && -f "$QA_COMPOSER_ROOT/vendor/autoload.php" ]]; then
+      check "autoloader" ok "$QA_COMPOSER_ROOT/vendor/autoload.php"
+    else
+      check "autoloader" warn "no vendor/autoload.php; run composer install for full analysis"
+    fi
+    if find_phpunit >/dev/null 2>&1; then
+      check "phpunit" ok "$(find_phpunit)"
+    else
+      check "phpunit" warn "not installed; add drupal/core-dev to run tests"
+    fi
+    if [[ -n "${QA_GIT_ROOT:-}" ]]; then
+      check "git" ok "$QA_GIT_ROOT"
+    else
+      check "git" warn "not a git repository; --changed is unavailable"
+    fi
+  fi
+
+  printf '\n' >&2
+  if [[ $problems -gt 0 ]]; then
+    error "$problems required component(s) missing."
+    log "  Enter the provided environment with: ${C_CYAN}nix develop${C_RESET}"
+    return 1
+  fi
+  info "Everything required is present."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+  parse_args "$@"
+
+  if [[ -z "$QA_COMMAND" ]]; then
+    usage
+    exit 0
+  fi
+
+  # `doctor --offline` is used by the flake's own check, where there is no
+  # project to inspect and no network.
+  if [[ "$QA_COMMAND" == "doctor" && "${QA_OFFLINE:-0}" == "1" ]]; then
+    QA_TARGET_PATH=$PWD; QA_PROJECT_ROOT=$PWD; QA_PROJECT_NAME=offline; QA_PROJECT_TYPE=unknown
+    cmd_doctor
+    exit $?
+  fi
+
+  resolve_target "$QA_TARGET"
+  QA_REPORT_DIR=${QA_REPORT_DIR:-$PWD}
+  [[ "${QA_FORMAT:-pretty}" != "pretty" ]] && mkdir -p "$QA_REPORT_DIR"
+
+  local rc=0
+  case $QA_COMMAND in
+    lint|check)     cmd_lint ;;
+    fix|format)     cmd_fix ;;
+    php-lint|lint-php) tool_php_lint ;;
+    composer-lint|composer) tool_composer_lint ;;
+    phpcs)          tool_phpcs ;;
+    phpcbf)         tool_phpcbf ;;
+    phpstan)        tool_phpstan ;;
+    cspell|spell)
+      if [[ "${QA_ACCEPT_WORDS:-0}" == "1" ]]; then cspell_accept_words; exit 0; fi
+      tool_cspell ;;
+    eslint)         tool_eslint ;;
+    stylelint)      tool_stylelint ;;
+    prettier)       tool_prettier ;;
+    twig|twigcs|twig-cs-fixer) tool_twig ;;
+
+    test|phpunit)   cmd_test ;;
+    nightwatch)     cmd_nightwatch ;;
+
+    ci)
+      if [[ "${QA_LIST:-0}" == "1" ]]; then cmd_ci_list; exit $?; fi
+      cmd_ci "${QA_PASSTHROUGH[@]}" ;;
+
+    init|setup)     cmd_init; exit $? ;;
+    baseline)       cmd_baseline; exit $? ;;
+    info|status)    cmd_info; exit 0 ;;
+    doctor)         cmd_doctor; exit $? ;;
+
+    *) die "Unknown command '$QA_COMMAND'. See 'drupal-qa --help'." ;;
+  esac
+
+  print_summary || rc=1
+  exit $rc
+}
+
+main "$@"

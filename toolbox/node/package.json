@@ -1,0 +1,23 @@
+{
+  "name": "drupal-nix-tools-node-toolbox",
+  "version": "0.1.0",
+  "description": "Pinned JS/CSS/spelling QA toolchain mirroring Drupal core CI validate jobs.",
+  "license": "GPL-2.0-or-later",
+  "private": true,
+  "dependencies": {
+    "cspell": "^9.8.0",
+    "eslint": "^8.57.1",
+    "eslint-config-airbnb-base": "^15.0.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-jsdoc": "^61.7.1",
+    "eslint-plugin-no-jquery": "^3.1.1",
+    "eslint-plugin-prettier": "^5.5.6",
+    "eslint-plugin-yml": "^1.19.1",
+    "prettier": "^3.6.2",
+    "stylelint": "^16.26.1",
+    "stylelint-config-standard": "^38.0.0",
+    "stylelint-order": "^7.0.1",
+    "stylelint-prettier": "^5.0.3"
+  }
+}

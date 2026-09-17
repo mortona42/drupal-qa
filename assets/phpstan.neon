@@ -1,0 +1,28 @@
+# Fallback PHPStan configuration for a Drupal project that has none of its own.
+#
+# Matches the default that Drupal's GitLab CI templates hand to contrib projects
+# (assets/phpstan.neon), so a clean run here means a clean `phpstan` CI job.
+# `drupal-qa` layers a generated overlay on top of this to inject the detected
+# Drupal root, the baseline path and a writable tmpDir.
+parameters:
+  level: 0
+
+  fileExtensions:
+    - php
+    - module
+    - inc
+    - install
+    - theme
+    - profile
+    - engine
+
+  reportUnmatchedIgnoredErrors: false
+
+  excludePaths:
+    analyseAndScan:
+      - */vendor/*
+      - */node_modules/*
+
+  ignoreErrors:
+    # new static() is a documented Drupal best practice, so it cannot be fixed.
+    - '#^Unsafe usage of new static#'
