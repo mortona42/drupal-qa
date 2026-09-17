@@ -84,7 +84,142 @@ print_summary() {
 
 # ---------------------------------------------------------------------------
 # PHP selection
+#
+# Getting this wrong is not a cosmetic problem. When the project's own
+# vendor/bin tools are used — which they are whenever the project installs them,
+# because they are the version-matched ones — Composer's generated
+# platform_check.php aborts with a fatal error if the interpreter is older than
+# the installed packages require. Every PHP tool then "fails" for a reason that
+# has nothing to do with the code being checked.
+#
+# So the version is derived from the project rather than from a global default.
 # ---------------------------------------------------------------------------
+
+# "80401" -> "8.4"
+php_id_to_version() {
+  local id=$1
+  printf '%d.%d' "$((id / 10000))" "$(((id / 100) % 100))"
+}
+
+# "8.4" -> 804, for ordering comparisons.
+php_version_rank() {
+  local v=$1 major minor
+  major=${v%%.*}
+  minor=${v#*.}
+  minor=${minor%%.*}
+  printf '%d' "$((major * 100 + ${minor:-0}))"
+}
+
+php_version_available() {
+  local var="DRUPAL_QA_PHP_${1//./_}"
+  [[ -n "${!var:-}" ]]
+}
+
+php_versions_available() {
+  local v out=""
+  for v in 8.3 8.4 8.5; do
+    php_version_available "$v" && out+="${out:+ }$v"
+  done
+  printf '%s' "$out"
+}
+
+# The exact minimum the installed packages enforce at runtime, read from the
+# check Composer generates. Authoritative: this is the code that throws.
+php_min_from_platform_check() {
+  local file="${QA_COMPOSER_ROOT:-}/vendor/composer/platform_check.php"
+  [[ -f "$file" ]] || return 1
+  local id
+  id=$(grep -oE 'PHP_VERSION_ID >= [0-9]+' "$file" | head -1 | grep -oE '[0-9]+$') || return 1
+  [[ -n "$id" ]] || return 1
+  php_id_to_version "$id"
+}
+
+# What the site actually runs under DDEV. ddev merges .ddev/config.*.yaml over
+# .ddev/config.yaml, so a later file wins.
+php_from_ddev() {
+  local root="${QA_DDEV_ROOT:-}"
+  [[ -n "$root" && -d "$root/.ddev" ]] || return 1
+  local file version=""
+  for file in "$root/.ddev/config.yaml" "$root"/.ddev/config.*.yaml; do
+    [[ -f "$file" ]] || continue
+    local found
+    found=$(grep -E '^[[:space:]]*php_version:' "$file" 2>/dev/null | tail -1 | sed -E 's/.*php_version:[[:space:]]*//' | tr -d '"'"'"' ')
+    [[ -n "$found" ]] && version=$found
+  done
+  [[ -n "$version" ]] || return 1
+  printf '%s' "$version"
+}
+
+php_from_composer() {
+  local file="${QA_COMPOSER_ROOT:-}/composer.json"
+  [[ -f "$file" ]] || return 1
+  local v
+  # config.platform.php is what Composer resolved against; require.php is the
+  # declared constraint. Take the first version-looking token out of either.
+  v=$(jq -r '.config.platform.php // .require.php // empty' "$file" 2>/dev/null) || return 1
+  v=$(grep -oE '[0-9]+\.[0-9]+' <<< "$v" | head -1)
+  [[ -n "$v" ]] || return 1
+  printf '%s' "$v"
+}
+
+# Decide once, at target-resolution time, unless --php said otherwise.
+detect_php_version() {
+  [[ -n "${QA_PHP_EXPLICIT:-}" ]] && return 0
+
+  local preferred="" source="" min=""
+  if preferred=$(php_from_ddev); then
+    source="DDEV config"
+  elif preferred=$(php_from_composer); then
+    source="composer.json"
+  else
+    preferred=${DRUPAL_QA_PHP_DEFAULT:-8.3}
+    source="default"
+  fi
+
+  # Raise, never lower: the installed packages' hard minimum wins over a
+  # preference that would crash on startup.
+  if min=$(php_min_from_platform_check); then
+    if [[ $(php_version_rank "$min") -gt $(php_version_rank "$preferred") ]]; then
+      debug "raising PHP $preferred -> $min (required by vendor/composer/platform_check.php)"
+      preferred=$min
+      source="required by installed packages"
+    fi
+  fi
+
+  if ! php_version_available "$preferred"; then
+    local have; have=$(php_versions_available)
+    # Falling back silently would reintroduce exactly the confusing fatal this
+    # detection exists to avoid, so say what happened.
+    warn "This project wants PHP $preferred ($source); this build provides $have."
+    local candidate best=""
+    for candidate in $have; do
+      [[ $(php_version_rank "$candidate") -ge $(php_version_rank "$preferred") ]] && { best=$candidate; break; }
+    done
+    if [[ -n "$best" ]]; then
+      warn "Using PHP $best instead."
+      preferred=$best
+    else
+      warn "Using the newest available. PHP tools from the project's vendor/bin may refuse to start."
+      preferred=${have##* }
+    fi
+    source="closest available"
+  fi
+
+  QA_PHP_VERSION=$preferred
+  QA_PHP_SOURCE=$source
+  export QA_PHP_VERSION QA_PHP_SOURCE
+
+  # Put the chosen interpreter first on PATH. Several things we shell out to
+  # resolve PHP themselves rather than being handed one: composer, and every
+  # vendor/bin script executed through its `#!/usr/bin/env php` shebang. Without
+  # this they would silently use whichever PHP the wrapper happened to provide,
+  # which is how a correct --php still ends in a platform-check fatal.
+  local php_bin; php_bin=$(resolve_php)
+  PATH="$(dirname "$php_bin"):$PATH"
+  export PATH
+
+  debug "PHP $QA_PHP_VERSION ($QA_PHP_SOURCE) at $php_bin"
+}
 
 resolve_php() {
   local version=${QA_PHP_VERSION:-${DRUPAL_QA_PHP_DEFAULT:-8.3}}
@@ -149,13 +284,35 @@ php_tool() {
   return 1
 }
 
-# Resolve a Node QA binary. Core's own node_modules wins when present because a
-# theme may rely on plugins core installs; the pinned toolbox is the fallback so
-# that no `yarn install` is ever required just to lint one file.
+# A binary sitting in node_modules/.bin is not proof that it runs. Core's
+# node_modules is whatever state the last `yarn install` left it in, and a copy
+# installed under an older Node refuses to start ("Unsupported NodeJS version").
+# Check before committing to one, so the failure is a clean fallback rather than
+# a confusing error attributed to the code being linted.
+node_tool_works() {
+  [[ -x "$1" ]] || return 1
+  "$1" --version >/dev/null 2>&1
+}
+
+node_tool_in() {
+  local dir=$1 name=$2
+  [[ -n "$dir" ]] || return 1
+  local bin="$dir/node_modules/.bin/$name"
+  node_tool_works "$bin" && { printf '%s' "$bin"; return 0; }
+  return 1
+}
+
+# Resolve a Node QA binary. The project's own node_modules wins, because a theme
+# that installs custom plugins means it; then the pinned toolbox, which is
+# known-good; then core's, as a last resort.
+#
+# Core is deliberately *not* second any more. Its node_modules exists only if
+# someone ran `yarn install` in core, and preferring a possibly-stale tree over
+# a version-pinned one trades reproducibility for nothing.
 node_tool() {
-  local name=$1 dir
-  for dir in "${QA_PROJECT_ROOT:-}/node_modules/.bin" "${QA_DRUPAL_ROOT:-}/core/node_modules/.bin" "${DRUPAL_QA_NODE_TOOLBOX:-}/node_modules/.bin"; do
-    [[ -n "$dir" && -x "$dir/$name" ]] && { printf '%s' "$dir/$name"; return 0; }
+  local name=$1 bin
+  for base in "${QA_PROJECT_ROOT:-}" "${DRUPAL_QA_NODE_TOOLBOX:-}" "${QA_DRUPAL_ROOT:-}/core"; do
+    bin=$(node_tool_in "$base" "$name") && { printf '%s' "$bin"; return 0; }
   done
   command -v "$name" 2>/dev/null && return 0
   return 1
@@ -164,8 +321,29 @@ node_tool() {
 # The directory ESLint/Stylelint should resolve plugins against.
 node_modules_root() {
   local dir
-  for dir in "${QA_PROJECT_ROOT:-}/node_modules" "${QA_DRUPAL_ROOT:-}/core/node_modules" "${DRUPAL_QA_NODE_TOOLBOX:-}/node_modules"; do
+  for dir in "${QA_PROJECT_ROOT:-}/node_modules" "${DRUPAL_QA_NODE_TOOLBOX:-}/node_modules" "${QA_DRUPAL_ROOT:-}/core/node_modules"; do
     [[ -n "$dir" && -d "$dir" ]] && { printf '%s' "${dir%/node_modules}"; return 0; }
+  done
+  return 1
+}
+
+# Major version of an ESLint binary. ESLint 8 reads .eslintrc files; ESLint 9
+# reads flat config and rejects most of the v8 command-line flags outright, so
+# the two cannot be driven the same way.
+eslint_major() {
+  local v
+  v=$("$1" --version 2>/dev/null) || return 1
+  v=${v#v}
+  printf '%s' "${v%%.*}"
+}
+
+# The first base directory offering an ESLint of at least $1.
+eslint_base_at_least() {
+  local want=$1 base bin major
+  for base in "${QA_PROJECT_ROOT:-}" "${QA_DRUPAL_ROOT:-}/core" "${DRUPAL_QA_NODE_TOOLBOX:-}"; do
+    bin=$(node_tool_in "$base" eslint) || continue
+    major=$(eslint_major "$bin") || continue
+    [[ "$major" -ge "$want" ]] && { printf '%s' "$base"; return 0; }
   done
   return 1
 }
@@ -361,6 +539,9 @@ resolve_target() {
 
   export QA_TARGET_PATH QA_PROJECT_ROOT QA_PROJECT_TYPE QA_PROJECT_NAME
   export QA_DRUPAL_ROOT QA_DDEV_ROOT QA_GIT_ROOT QA_COMPOSER_ROOT QA_COMPOSER_BIN_DIR QA_CORE_VERSION
+
+  # Needs QA_COMPOSER_ROOT and QA_DDEV_ROOT, so it runs last.
+  detect_php_version
 }
 
 project_root_of() {

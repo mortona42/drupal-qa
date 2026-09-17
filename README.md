@@ -120,7 +120,7 @@ Each command corresponds to a job in Drupal's GitLab CI templates.
 | `phpcs` / `phpcbf` | PHP_CodeSniffer + drupal/coder | `phpcs` |
 | `phpstan` | PHPStan + mglaman/phpstan-drupal | `phpstan` |
 | `cspell` | CSpell | `cspell` |
-| `eslint` | ESLint 8 | `eslint` |
+| `eslint` | ESLint 8 or 9 | `eslint` |
 | `stylelint` | Stylelint | `stylelint` |
 | `prettier` | Prettier | via the ESLint/Stylelint plugins |
 | `twig` | Twig CS Fixer | `twig-cs-fixer` |
@@ -155,6 +155,15 @@ Two details worth knowing:
 - **Core's dictionaries are wired into CSpell** when a Drupal root is present.
   Without them a spell check on Drupal code reports thousands of false positives
   and gets switched off within a day.
+- **Both ESLint eras are handled.** Drupal 11 core ships `.eslintrc.json` and
+  pins ESLint 8; Drupal 12 core ships `eslint.config.mjs` and pins ESLint 9,
+  which rejects `--ext` and `--no-eslintrc` outright. The config style decides
+  which binary runs: a flat config uses the ESLint next to it (its plugins are
+  imported by name and only resolve from there), an `.eslintrc` uses the pinned
+  ESLint 8 from the toolbox.
+- **Node binaries are checked before use.** A `node_modules` installed under an
+  older Node has tools that refuse to start; the run falls back to the pinned
+  toolbox instead of blaming your code.
 - **YAML is linted but not Prettier-formatted**, because Prettier rewrites
   `description: 'Foo'` in an `.info.yml` to double quotes and CI does not. The CI
   job achieves this by writing a `.prettierignore` into your checkout; this tool
@@ -291,14 +300,28 @@ long-lived feature branch does not re-report itself on every run.
 
 ## Choosing a PHP version
 
-```sh
-drupal-qa lint --php=8.4
-drupal-qa test --php=8.5
-```
+The version is **detected from the project**, because getting it wrong produces
+failures that look like code problems and are not. When a project installs its
+own QA tools, those are the ones used (they are version-matched to its core), and
+Composer's generated `platform_check.php` aborts with a fatal error if the
+interpreter is older than the installed packages require. Every PHP tool then
+"fails" for reasons unrelated to your code.
 
-8.3, 8.4 and 8.5 are provided. The default is **8.3**, Drupal 11's minimum and
-what contrib CI targets — the version most likely to catch a syntax or typing
-mistake you would otherwise ship.
+Detection order:
+
+1. `--php=8.4`, if you pass it.
+2. DDEV's `php_version`, including `.ddev/config.*.yaml` overrides — what the
+   site actually runs.
+3. `composer.json`: `config.platform.php`, else the `require.php` constraint.
+4. Otherwise 8.3, Drupal 11's minimum and what contrib CI targets.
+
+Whatever that produces is then **raised** if `vendor/composer/platform_check.php`
+demands more. 8.3, 8.4 and 8.5 are provided; if a project wants something else
+you are told, rather than left to decode a platform-check backtrace.
+
+`drupal-qa info` prints the chosen version and where it came from. The chosen
+interpreter also goes to the front of `PATH`, so Composer and any `vendor/bin`
+script run through its shebang agree with it.
 
 ---
 

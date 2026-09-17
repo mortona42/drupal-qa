@@ -308,7 +308,11 @@ cmd_test() {
   info "Running $(basename "$phpunit") on $shown"
 
   local status=pass
-  ( cd "$QA_DRUPAL_ROOT/core" && run_cmd env "${env_args[@]}" "$phpunit" "${args[@]}" "${QA_TEST_PATHS[@]}" ) || status=fail
+  # Invoke through the chosen interpreter rather than letting the vendor script's
+  # shebang pick one: the project's packages often require a newer PHP than the
+  # default, and Composer's platform check turns that into a fatal error.
+  ( cd "$QA_DRUPAL_ROOT/core" \
+      && run_cmd env "${env_args[@]}" "$(resolve_php)" "$phpunit" "${args[@]}" "${QA_TEST_PATHS[@]}" ) || status=fail
 
   local -a browser_files=("$QA_BROWSER_OUTPUT_DIR"/*)
   if [[ "$status" == fail && -e "${browser_files[0]}" ]]; then

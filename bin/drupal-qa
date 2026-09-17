@@ -91,7 +91,10 @@ ${C_BOLD}COMMON OPTIONS${C_RESET}
                           with the upstream branch). The way to make an
                           inherited codebase reviewable.
   --fix                   Let fixable tools fix instead of report
-  --php=<8.3|8.4|8.5>     PHP version to run tools under (default: ${DRUPAL_QA_PHP_DEFAULT:-8.3})
+  --php=<8.3|8.4|8.5>     PHP version to run tools under. Detected from the
+                          project by default: DDEV's php_version, then
+                          composer.json, raised if the installed packages
+                          require more
   --core=<path>           Drupal root, when it cannot be found automatically
   --config-source=<src>   auto (default) | project | core | bundled
   --level=<n>             PHPStan level override
@@ -180,8 +183,8 @@ parse_args() {
       --coverage)       QA_COVERAGE_DRIVER=pcov ;;
       --coverage=*)     QA_COVERAGE_DRIVER=${arg#*=} ;;
 
-      --php=*)          QA_PHP_VERSION=${arg#*=} ;;
-      --php)            shift; QA_PHP_VERSION=$1 ;;
+      --php=*)          QA_PHP_VERSION=${arg#*=}; QA_PHP_EXPLICIT=1 ;;
+      --php)            shift; QA_PHP_VERSION=$1; QA_PHP_EXPLICIT=1 ;;
       --core=*)         QA_CORE_OVERRIDE=${arg#*=} ;;
       --core)           shift; QA_CORE_OVERRIDE=$1 ;;
       --config-source=*) QA_CONFIG_SOURCE=${arg#*=} ;;
@@ -282,7 +285,7 @@ row() { printf '  %s%-22s%s %s\n' "$C_DIM" "$1" "$C_RESET" "${2:-—}" >&2; }
 cmd_info() {
   printf '\n%sEnvironment%s\n' "$C_BOLD" "$C_RESET" >&2
   row "drupal-qa" "$QA_VERSION"
-  row "PHP" "$($(resolve_php) -r 'echo PHP_VERSION;' 2>/dev/null) ($(resolve_php))"
+  row "PHP" "$($(resolve_php) -r 'echo PHP_VERSION;' 2>/dev/null) - ${QA_PHP_SOURCE:-default}"
   row "Node" "$("${DRUPAL_QA_NODE:-node}" --version 2>/dev/null)"
   row "PHP toolbox" "$(php_toolbox_vendor 2>/dev/null || echo 'not found')"
   row "Node toolbox" "${DRUPAL_QA_NODE_TOOLBOX:-not set}"

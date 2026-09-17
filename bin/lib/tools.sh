@@ -257,30 +257,43 @@ cspell_accept_words() {
 # ---------------------------------------------------------------------------
 
 tool_eslint() {
-  local bin; bin=$(node_tool eslint) || { record_result eslint skip "eslint unavailable"; return 0; }
   has_files_with_ext "$JS_EXTS" || { record_result eslint skip "no JS/YAML files"; return 0; }
 
   local list; list=$(target_paths_for "$JS_EXTS")
   read_paths "$list" || { record_result eslint skip "no changed JS/YAML files"; return 0; }
 
-  local config; config=$(config_eslint)
+  # config_eslint picks the binary too: ESLint 8 and 9 read different config
+  # formats and accept different flags, so they cannot be chosen independently.
+  # It must be called with stdout redirected rather than in $(...), or the
+  # variables it sets would be trapped in the subshell and the v8 flags would be
+  # used against a v9 binary.
+  QA_CONFIG_FILE=""
+  config_eslint > /dev/null
+  local config=$QA_CONFIG_FILE
+  local bin=${QA_ESLINT_BIN:-}
+  [[ -n "$bin" ]] || bin=$(node_tool eslint) || { record_result eslint skip "eslint unavailable"; return 0; }
+
   announce "eslint" "$config"
 
-  # shellcheck disable=SC2054  # --ext takes a comma-separated list; it is one argument.
-  local -a args=(--no-error-on-unmatched-pattern --ignore-pattern='*.es6.js' --ext=.js,.yml)
-  # config_eslint always hands back a file that is safe to pass explicitly: a
-  # project's own config when it ships a .prettierignore, otherwise a generated
-  # overlay that extends it.
+  local -a args=(--no-error-on-unmatched-pattern)
   args+=(--config "$config")
-  # --config does not switch off the cascade. Linting core/modules/ban would
-  # therefore also pick up web/core/.eslintrc.json, whose `extends: airbnb-base`
-  # cannot resolve unless core's node_modules is installed — so the run dies on
-  # a config error rather than reporting anything. When we chose the config,
-  # ours is the only one that should apply.
-  [[ "$QA_CONFIG_ORIGIN" != project* ]] && args+=(--no-eslintrc)
-  local root
-  root=$(node_modules_root) && args+=(--resolve-plugins-relative-to "$root")
   args+=(--cache --cache-location "$(cache_dir)/eslint.cache")
+
+  if [[ "${QA_ESLINT_FLAT:-0}" == "1" ]]; then
+    # Flat config declares its own file patterns and resolves its own plugins;
+    # --ext, --resolve-plugins-relative-to and --no-eslintrc were all removed.
+    :
+  else
+    # shellcheck disable=SC2054  # --ext takes a comma-separated list; one argument.
+    args+=(--ignore-pattern='*.es6.js' --ext=.js,.yml)
+    [[ -n "${QA_ESLINT_BASE:-}" ]] && args+=(--resolve-plugins-relative-to "$QA_ESLINT_BASE")
+    # --config does not switch off the cascade. Linting core/modules/node would
+    # otherwise also pick up core/.eslintrc.json, whose `extends: airbnb-base`
+    # cannot resolve unless core's node_modules is installed, so the run dies on
+    # a config error instead of reporting anything.
+    [[ "$QA_CONFIG_ORIGIN" != project* ]] && args+=(--no-eslintrc)
+  fi
+
   [[ "${QA_FIX:-0}" == "1" ]] && args+=(--fix)
   case "${QA_FORMAT:-pretty}" in
     junit)  args+=(--format=junit --output-file="${QA_REPORT_DIR:-$PWD}/eslint-junit.xml") ;;
