@@ -62,6 +62,41 @@ emit_config() {
   printf '%s' "$1"
 }
 
+# Resolve a tool's configuration *without* a subshell, so the provenance the
+# lookup records is visible afterwards. `c=$(config_phpcs)` traps
+# QA_CONFIG_ORIGIN inside the subshell, leaving whatever the previous tool set —
+# which is how a Twig run ended up announcing ESLint's config.
+#
+#   resolve_config config_phpcs
+#   echo "$QA_CONFIG_FILE  ($QA_CONFIG_ORIGIN)"
+# Does this config, or anything it extends, load eslint-plugin-prettier?
+# Follows local `extends` paths only; a package name such as "airbnb-base" is
+# left alone, and the one that matters ("plugin:prettier/recommended") matches
+# the grep directly.
+config_mentions_prettier() {
+  local file=$1 depth=${2:-3}
+  [[ -f "$file" ]] || return 1
+  grep -q 'prettier' "$file" 2>/dev/null && return 0
+  [[ $depth -le 0 ]] && return 1
+
+  local dir ext
+  dir=$(dirname "$file")
+  while IFS= read -r ext; do
+    [[ -z "$ext" ]] && continue
+    case "$ext" in
+      /*)       config_mentions_prettier "$ext" $((depth - 1)) && return 0 ;;
+      ./*|../*) config_mentions_prettier "$dir/$ext" $((depth - 1)) && return 0 ;;
+    esac
+  done < <(jq -r '(.extends // []) | if type == "array" then .[] else . end' "$file" 2>/dev/null)
+  return 1
+}
+
+resolve_config() {
+  QA_CONFIG_FILE=""
+  QA_CONFIG_ORIGIN=""
+  "$1" > /dev/null
+}
+
 # ---------------------------------------------------------------------------
 # PHPCS
 # ---------------------------------------------------------------------------
@@ -298,30 +333,60 @@ prettier_options_json() {
   fi
 }
 
+# ESLint has two incompatible eras and Drupal spans both: Drupal 11 core ships
+# .eslintrc.json files and pins ESLint 8, Drupal 12 core ships eslint.config.mjs
+# and pins ESLint 9. The flags differ too — ESLint 9 rejects --ext and
+# --no-eslintrc — so the config style decides everything, including which
+# binary to run.
+#
+# Sets QA_ESLINT_FLAT, QA_ESLINT_BIN and QA_ESLINT_BASE alongside the config.
 config_eslint() {
-  local base stage overlay flat=0 binbase=""
+  local stage overlay flat=0 binbase=""
+  local core_base="" project_base=""
 
-  if base=$(project_config eslint.config.js eslint.config.mjs eslint.config.cjs) \
+  # --- Flat config (Drupal 12 and later) -----------------------------------
+  local flat_base=""
+  if flat_base=$(project_config eslint.config.js eslint.config.mjs eslint.config.cjs) \
      && binbase=$(eslint_base_at_least 9); then
     flat=1
-    set_origin "project ($(basename "$base"))"
-  elif base=$(project_config .eslintrc.json .eslintrc .eslintrc.js .eslintrc.yml); then
-    set_origin "project ($(basename "$base"))"
-  elif base=$(core_config core/eslint.passing.config.mjs core/eslint.config.mjs core/eslint.config.js) \
+    set_origin "project ($(basename "$flat_base"))"
+  elif flat_base=$(core_config core/eslint.passing.config.mjs core/eslint.config.mjs core/eslint.config.js) \
        && binbase=$(eslint_base_at_least 9); then
     # Core's flat config imports its plugins by name, so it only works from a
     # node_modules that has them — core's own.
     flat=1
-    set_origin "Drupal core ($(basename "$base"))"
-  elif base=$(core_config core/.eslintrc.passing.json) && [[ -d "$QA_DRUPAL_ROOT/core/node_modules" ]]; then
+    set_origin "Drupal core ($(basename "$flat_base"))"
+  fi
+
+  # --- eslintrc (Drupal 11 and earlier) ------------------------------------
+  if [[ $flat -eq 0 ]]; then
     # Core's eslintrc extends airbnb-base and plugin:prettier/recommended, which
     # resolve relative to the config file. Without core's node_modules installed
-    # it would die with "Cannot find module", so fall through to the staged copy.
-    set_origin "Drupal core (.eslintrc.passing.json)"
-  else
-    stage=$(stage_node_config eslint)
-    base="$stage/.eslintrc.passing.json"
-    set_origin "bundled core copy"
+    # it would die with "Cannot find module", so fall back to the staged copy.
+    if core_base=$(core_config core/.eslintrc.passing.json) && [[ -d "$QA_DRUPAL_ROOT/core/node_modules" ]]; then
+      set_origin "Drupal core (.eslintrc.passing.json)"
+    else
+      stage=$(stage_node_config eslint)
+      core_base="$stage/.eslintrc.passing.json"
+      set_origin "bundled core copy"
+    fi
+
+    if project_base=$(project_config .eslintrc.json .eslintrc .eslintrc.js .eslintrc.yml); then
+      # A project config *adds to* core's rules; it does not replace them. This
+      # is what the CI job arranges by symlinking core's .eslintrc.passing.json
+      # into the directory above the project, so both apply. Reproducing it here
+      # means a module that adds an .eslintrc.json purely to declare a global
+      # does not silently lose every Drupal rule.
+      #
+      # Unless the project says otherwise: "root": true is a deliberate
+      # statement that its config is the whole story.
+      if jq -e '.root == true' "$project_base" >/dev/null 2>&1; then
+        core_base=""
+        set_origin "project ($(basename "$project_base"), root)"
+      else
+        set_origin "$QA_CONFIG_ORIGIN + project ($(basename "$project_base"))"
+      fi
+    fi
   fi
 
   QA_ESLINT_FLAT=$flat
@@ -342,18 +407,19 @@ config_eslint() {
   # overlay config rather than by writing a file into someone's repository. A
   # project that ships its own .prettierignore has made this decision already,
   # so leave it alone.
-  if [[ -f "$QA_PROJECT_ROOT/.prettierignore" ]]; then
-    emit_config "$base"
-    return 0
-  fi
+  local skip_yaml_layer=0
+  [[ -f "$QA_PROJECT_ROOT/.prettierignore" ]] && skip_yaml_layer=1
 
   if [[ $flat -eq 1 ]]; then
-    # A flat overlay has to be real JavaScript that imports the base config.
+    if [[ $skip_yaml_layer -eq 1 ]]; then
+      emit_config "$flat_base"
+      return 0
+    fi
     overlay="$(cache_dir)/eslint.overlay.mjs"
     local popts; popts=$(prettier_options_json) || popts=""
     {
-      printf '// Generated by drupal-qa. Extends %s.\n' "$base"
-      printf "import base from '%s';\n\n" "$base"
+      printf '// Generated by drupal-qa. Extends %s.\n' "$flat_base"
+      printf "import base from '%s';\n\n" "$flat_base"
       printf 'const layers = Array.isArray(base) ? base : [base];\n'
       printf 'export default [\n'
       printf '  ...layers,\n'
@@ -368,32 +434,50 @@ config_eslint() {
       printf '  },\n'
       printf '];\n'
     } > "$overlay"
-  else
-    stage=${stage:-$(stage_node_config eslint)}
-    overlay="$stage/.eslintrc.overlay.json"
-    local popts; popts=$(prettier_options_json) || popts=""
-    if [[ -n "$popts" ]]; then
-      jq -n --arg base "$base" --argjson popts "$popts" '{
-          root: true,
-          extends: [$base],
-          rules: { "prettier/prettier": ["error", $popts, { usePrettierrc: false }] },
-          overrides: [{
-            files: ["*.yml", "*.yaml"],
-            rules: { "prettier/prettier": "off" }
-          }]
-        }' > "$overlay"
-    else
-      jq -n --arg base "$base" '{
-          root: true,
-          extends: [$base],
-          overrides: [{
-            files: ["*.yml", "*.yaml"],
-            rules: { "prettier/prettier": "off" }
-          }]
-        }' > "$overlay"
-    fi
+    set_origin "$QA_CONFIG_ORIGIN + YAML formatting off (as CI does)"
+    emit_config "$overlay"
+    return 0
   fi
-  set_origin "$QA_CONFIG_ORIGIN + YAML formatting off (as CI does)"
+
+  # eslintrc: one overlay that layers core then the project, in that order, so
+  # the project wins on conflicts.
+  stage=${stage:-$(stage_node_config eslint)}
+  overlay="$stage/.eslintrc.overlay.json"
+  local -a layers=()
+  [[ -n "$core_base" ]] && layers+=("$core_base")
+  [[ -n "$project_base" ]] && layers+=("$project_base")
+  local layers_json
+  layers_json=$(printf '%s\n' "${layers[@]}" | jq -R . | jq -sc .)
+
+  # Configuring prettier/prettier when nothing loads eslint-plugin-prettier makes
+  # ESLint report "Definition for rule 'prettier/prettier' was not found" once
+  # per file. Core's config always loads it; a project that took over with
+  # "root": true may not.
+  #
+  # The check has to follow `extends`: core's .eslintrc.passing.json never
+  # mentions prettier itself, it inherits the plugin from the .eslintrc.json it
+  # extends. Looking only at the top file concludes "no prettier", drops the
+  # YAML override with it, and Prettier then rewrites every quoted value in
+  # every .yml file in the project.
+  local layer has_prettier=0
+  for layer in "${layers[@]}"; do
+    config_mentions_prettier "$layer" && { has_prettier=1; break; }
+  done
+  [[ $has_prettier -eq 0 ]] && skip_yaml_layer=1
+
+  local popts=""
+  [[ $skip_yaml_layer -eq 0 ]] && { popts=$(prettier_options_json) || popts=""; }
+
+  jq -n --argjson layers "$layers_json" --argjson popts "${popts:-null}" --argjson yaml "$([[ $skip_yaml_layer -eq 0 ]] && echo true || echo false)" '
+      { root: true, extends: $layers }
+      + (if $popts == null then {} else
+          { rules: { "prettier/prettier": ["error", $popts, { usePrettierrc: false }] } } end)
+      + (if $yaml then
+          { overrides: [{ files: ["*.yml", "*.yaml"], rules: { "prettier/prettier": "off" } }] }
+         else {} end)
+    ' > "$overlay"
+
+  [[ $skip_yaml_layer -eq 0 ]] && set_origin "$QA_CONFIG_ORIGIN + YAML formatting off (as CI does)"
   emit_config "$overlay"
 }
 

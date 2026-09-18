@@ -155,6 +155,17 @@ Two details worth knowing:
 - **Core's dictionaries are wired into CSpell** when a Drupal root is present.
   Without them a spell check on Drupal code reports thousands of false positives
   and gets switched off within a day.
+- **A project's ESLint config adds to core's, it does not replace it.** The CI
+  job arranges this by symlinking core's `.eslintrc.passing.json` into the
+  directory above the project so both apply; the generated overlay layers them
+  explicitly instead, project last so it wins on conflicts. That matters because
+  a module often adds an `.eslintrc.json` for one reason — declaring a global
+  like `Prism` — and would otherwise silently lose every Drupal rule. A project
+  that sets `"root": true` is taken at its word and used alone.
+- **The `.eslintrc` cascade is switched off.** Drupal scaffolds
+  `web/.eslintrc.json` into every site, extending `core/.eslintrc.json`, so
+  ESLint walking up from a module would drag that in and fail on
+  `extends: airbnb-base` unless core's `node_modules` is installed.
 - **Both ESLint eras are handled.** Drupal 11 core ships `.eslintrc.json` and
   pins ESLint 8; Drupal 12 core ships `eslint.config.mjs` and pins ESLint 9,
   which rejects `--ext` and `--no-eslintrc` outright. The config style decides
@@ -284,6 +295,91 @@ drupal-qa init --with=envrc       # direnv integration
 Available: `phpcs`, `phpstan`, `cspell`, `eslint`, `stylelint`, `prettier`,
 `editorconfig`, `gitattributes`, `gitignore`, `gitlab-ci`, `ddev`, `envrc`.
 
+### When phpcbf will not fix something
+
+PHPCS marks each message `[x]` or `[ ]` in its report. Only `[x]` messages can be
+fixed automatically, and the distinction is deliberate: rewrapping a line that
+exceeds 80 characters, removing a `dpm()` call or writing a missing description
+all need a person, so PHPCS declines rather than guessing.
+
+`drupal-qa phpcbf` now says how many it had to leave:
+
+```
+pass   phpcbf    fixed 200, 61 not auto-fixable
+```
+
+Two other things surprise people, and neither is a bug:
+
+- **The fixer can create new violations.** Fixing `FunctionComment.Missing`
+  inserts an empty `/** */` block, which then reports `DocComment.Empty` and
+  `DocComment.MissingShort` — both `[ ]`. That is PHPCS saying "I have put the
+  docblock where it belongs; the sentence is yours."
+- **Running it twice changes nothing.** PHPCBF already loops internally until a
+  file stops changing.
+
+### Will a warning fail CI?
+
+PHPCS exits non-zero for warnings alone, so a warning-only run is a failed
+`phpcs` job. Whether that *blocks* anything is a separate question, and the
+answer is in the pipeline, not the tool:
+
+```sh
+drupal-qa ci --list
+```
+
+```
+phpcs        validate  on_success  allow_failure: true
+composer-lint validate on_success  allow_failure: false
+phpunit      test      on_success  allow_failure: false
+```
+
+Drupal's CI templates mark every linting job `allow_failure: true` by default:
+reported and shown as failed, but not blocking. A project makes one blocking with
+`_PHPCS_ALLOW_FAILURE: '0'` — and because warnings alone fail phpcs, that turns a
+single over-long line into a blocked merge request. `drupal-qa init --gitlab-ci`
+scaffolds exactly that for phpcs and phpstan, with a comment saying so; delete
+the two lines to follow the template defaults.
+
+The middle ground is to block on errors and merely report warnings:
+
+```yaml
+_PHPCS_EXTRA: '--runtime-set ignore_warnings_on_exit 1'
+```
+
+Locally, the summary shows the split, because that is what decides the outcome:
+
+```
+FAIL   phpcs    0 error(s), 1 warning(s)
+```
+
+### Keeping the spell check useful
+
+CSpell is the check people switch off first, because Drupal code is full of
+legitimate words no dictionary has. Core's own dictionaries are wired in
+automatically; the rest go in the project dictionary, which by convention (and
+by Drupal CI's `_CSPELL_DICTIONARY` default) is `.cspell-project-words.txt`.
+
+```sh
+drupal-qa cspell my_module --accept-words --dry-run   # what would be accepted
+drupal-qa cspell my_module --accept-words             # accept it
+drupal-qa cspell my_module --accept-words --changed   # only words you introduced
+drupal-qa cspell my_module --accept-words --dictionary=my-words.txt
+```
+
+Accepting is a separate command, never part of `drupal-qa fix`, because it
+asserts that a word is *not* a typo — a fixer that silently blesses `recieve` is
+worse than no spell check. Hence `--dry-run`, and `--changed`, which limits the
+list to files you have touched so an inherited backlog stays out of it.
+
+The dictionary file is picked in this order: `--dictionary`, then any `.txt`
+dictionary the project's own CSpell config declares, then the Drupal default.
+Afterwards the check is re-run: if the words are still reported, your config does
+not actually load the file, and you are told what to add rather than left with a
+dictionary nothing reads.
+
+For a word that belongs in exactly one file, prefer a CSpell inline comment
+there — `cspell:ignore somethingveryspecific` — over the shared dictionary.
+
 ### Inheriting a codebase with thousands of warnings
 
 Two tools make this bearable:
@@ -324,6 +420,56 @@ interpreter also goes to the front of `PATH`, so Composer and any `vendor/bin`
 script run through its shebang agree with it.
 
 ---
+
+## Running the tools yourself
+
+The wrapper is a convenience, not a cage. Three ways out of it, in increasing
+order of independence.
+
+**See the command it ran.** Every check accepts `-v`:
+
+```sh
+drupal-qa phpcs my_module -v
+```
+
+It prints the full command — config file, standard, installed_paths, cache
+location — which you can paste and edit.
+
+**Run a tool with the project's environment.** `exec` hands you the PHP version
+detected for this project and the right copies of the tools on `PATH`, then gets
+out of the way:
+
+```sh
+drupal-qa exec phpcs --standard=Drupal src/
+drupal-qa exec phpstan analyse --level=6 src/
+drupal-qa exec --toolchain=pinned phpcs --version   # the pinned copy instead
+drupal-qa exec --php=8.3 php -v                     # a different interpreter
+```
+
+Its own flags may precede the command; the first bare word starts the command,
+and everything after belongs to it. Use `--` if your command starts with a dash.
+`drupal-qa env` prints the same settings as shell exports for
+`eval "$(drupal-qa env)"`.
+
+**Put them on `PATH` for a whole session:**
+
+```sh
+nix develop
+phpcs --standard=Drupal src/
+phpstan analyse src/
+eslint js/
+```
+
+This matters more than it sounds. Without it, `phpcs` in your shell is whatever
+is first on `PATH` — usually a global Composer install that has never heard of
+the Drupal standard, so `--standard=Drupal` fails with an error that looks like a
+configuration problem. The shell puts the pinned copies first, with `Drupal`,
+`DrupalPractice`, `VariableAnalysis` and `SlevomatCodingStandard` registered.
+
+One difference worth knowing: tools on `PATH` in the dev shell run under the
+flake's default PHP, because a shell has no single project. `drupal-qa` and
+`drupal-qa exec` detect the version per project. If the project's packages
+require a newer PHP, use `exec`.
 
 ## Caching
 

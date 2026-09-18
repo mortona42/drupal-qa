@@ -384,13 +384,22 @@ variables:
   # version most likely to expose a syntax or typing mistake.
   # _TARGET_PHP: '8.3'
 
-  # Turn a linting job from advisory into blocking by setting it to "0".
-  # The templates default most of these to allow_failure: true.
+  # The templates mark every linting job allow_failure by default: it is
+  # reported, and shown as failed, but does not block the pipeline. Setting a
+  # job to "0" makes it blocking.
+  #
+  # Note what that means for phpcs: it exits non-zero for warnings alone, so
+  # with '0' a single "line exceeds 80 characters" blocks the merge request.
+  # That is a deliberate choice, not an accident — remove these two lines to
+  # follow the template defaults instead.
   _PHPCS_ALLOW_FAILURE: '0'
   _PHPSTAN_ALLOW_FAILURE: '0'
   # _CSPELL_ALLOW_FAILURE: '0'
   # _ESLINT_ALLOW_FAILURE: '0'
   # _STYLELINT_ALLOW_FAILURE: '0'
+
+  # Middle ground: block on errors, report warnings without failing.
+  # _PHPCS_EXTRA: '--runtime-set ignore_warnings_on_exit 1'
 
   # Skip jobs that do not apply to this project.
   # SKIP_NIGHTWATCH: '1'
@@ -404,7 +413,8 @@ EOF
 
 cmd_baseline() {
   local bin; bin=$(php_tool phpstan) || die "phpstan is not available."
-  local config; config=$(config_phpstan)
+  resolve_config config_phpstan
+  local config=$QA_CONFIG_FILE
   local out="${QA_PROJECT_ROOT}/phpstan-baseline.neon"
 
   info "Generating a PHPStan baseline for $QA_PROJECT_NAME"
@@ -430,4 +440,36 @@ cmd_baseline() {
   else
     warn "No baseline was produced; PHPStan may have found nothing to accept."
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Direct tool access
+# ---------------------------------------------------------------------------
+
+cmd_exec() {
+  [[ $# -gt 0 ]] || die "Usage: drupal-qa exec <command> [args...]   (e.g. drupal-qa exec phpcs --version)"
+
+  local extra; extra=$(qa_tool_path)
+  [[ -n "$extra" ]] && export PATH="$extra:$PATH"
+
+  # Anything the tools might reasonably want to know about the project, so a
+  # script run this way does not have to rediscover it.
+  export DRUPAL_ROOT=${QA_DRUPAL_ROOT:-}
+  export DRUPAL_QA_PROJECT_ROOT=$QA_PROJECT_ROOT
+  export DRUPAL_QA_COMPOSER_ROOT=${QA_COMPOSER_ROOT:-}
+
+  debug "exec: $* (PHP ${QA_PHP_VERSION:-?}, from ${QA_PHP_SOURCE:-?})"
+  exec "$@"
+}
+
+# Print the environment as shell exports, for `eval "$(drupal-qa env)"`.
+cmd_env() {
+  local extra; extra=$(qa_tool_path)
+  printf '# drupal-qa environment for %s\n' "$QA_PROJECT_ROOT"
+  # shellcheck disable=SC2016  # This is literal text for the user to copy.
+  printf '# Apply with: eval "$(drupal-qa env)"\n'
+  printf 'export PATH=%q\n' "${extra:+$extra:}$PATH"
+  printf 'export DRUPAL_ROOT=%q\n' "${QA_DRUPAL_ROOT:-}"
+  printf 'export DRUPAL_QA_PROJECT_ROOT=%q\n' "$QA_PROJECT_ROOT"
+  printf 'export DRUPAL_QA_COMPOSER_ROOT=%q\n' "${QA_COMPOSER_ROOT:-}"
 }

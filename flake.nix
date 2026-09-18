@@ -87,6 +87,27 @@
 
         ciDeps = [ pkgs.gitlab-ci-local ];
 
+        # The pinned QA tools as ordinary commands, for running them directly.
+        #
+        # Without this the dev shell silently hands you whatever `phpcs` is on
+        # the user's PATH — typically a global Composer install with no Drupal
+        # standard registered, which then fails in a way that looks like a
+        # configuration problem. Wrapping each tool with an explicit interpreter
+        # also means they work from anywhere, not only inside the shell.
+        qaTools = pkgs.runCommand "drupal-qa-tools" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+          mkdir -p $out/bin
+
+          for f in ${phpToolbox}/share/php/*/vendor/bin/*; do
+            [ -f "$f" ] || continue
+            makeWrapper ${defaultPhp}/bin/php $out/bin/"$(basename "$f")" --add-flags "$f"
+          done
+
+          for f in ${nodeToolbox}/node_modules/.bin/*; do
+            [ -e "$f" ] || continue
+            ln -sfn "$f" $out/bin/"$(basename "$f")"
+          done
+        '';
+
         drupal-qa = pkgs.stdenv.mkDerivation {
           pname = "drupal-qa";
           version = "0.1.0";
@@ -145,7 +166,12 @@
       in
       {
         packages = {
-          inherit drupal-qa phpToolbox nodeToolbox;
+          inherit
+            drupal-qa
+            phpToolbox
+            nodeToolbox
+            qaTools
+            ;
           default = drupal-qa;
         }
         // lib.mapAttrs' (v: p: lib.nameValuePair "php-${lib.replaceStrings [ "." ] [ "_" ] v}" p) phpEnvs;
@@ -157,11 +183,22 @@
 
         devShells.default = pkgs.mkShell {
           name = "drupal-qa";
-          packages = [ drupal-qa ] ++ runtimeDeps ++ browserDeps ++ ciDeps ++ [ pkgs.shellcheck ];
+          # qaTools first, so `phpcs` in this shell is the pinned one with Drupal
+          # and DrupalPractice registered, not a global Composer install.
+          packages = [
+            qaTools
+            drupal-qa
+          ]
+          ++ runtimeDeps
+          ++ browserDeps
+          ++ ciDeps
+          ++ [ pkgs.shellcheck ];
 
           shellHook = ''
             echo "drupal-qa $DRUPAL_QA_VERSION  ·  php $(php -r 'echo PHP_VERSION;')  ·  node $(node --version)"
-            echo "Try: drupal-qa info   |   drupal-qa lint <path-or-module>   |   drupal-qa --help"
+            echo "Wrapper: drupal-qa info | drupal-qa lint <path-or-module> | drupal-qa --help"
+            echo "Direct:  phpcs phpcbf phpstan twig-cs-fixer parallel-lint eslint stylelint prettier cspell"
+            echo "         (direct tools run under PHP ${defaultPhpVersion}; drupal-qa picks the project's own)"
           '';
         };
 

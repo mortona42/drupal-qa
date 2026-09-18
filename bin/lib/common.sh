@@ -6,7 +6,8 @@
 # Output
 # ---------------------------------------------------------------------------
 
-if [[ -t 1 && "${NO_COLOR:-}" == "" && "${DRUPAL_QA_COLOR:-auto}" != "never" ]]; then
+if [[ "${DRUPAL_QA_COLOR:-auto}" == "always" ]] \
+  || [[ -t 1 && "${NO_COLOR:-}" == "" && "${DRUPAL_QA_COLOR:-auto}" != "never" ]]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
   C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
   C_BLUE=$'\033[34m'; C_CYAN=$'\033[36m'
@@ -14,6 +15,16 @@ else
   C_RESET=''; C_BOLD=''; C_DIM=''
   C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''
 fi
+
+# True when colour is on. The tools have to be told separately: they write to
+# their own stdout and have no idea what --no-color did to ours, so without this
+# `drupal-qa lint --no-color | grep` still gets escape sequences.
+qa_color_enabled() { [[ -n "$C_RESET" ]]; }
+
+# Append a tool's own colour flag. Usage: color_args "--colors" "--no-colors"
+color_args() {
+  if qa_color_enabled; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
 
 log()    { printf '%s\n' "$*" >&2; }
 info()   { printf '%s==>%s %s\n' "$C_BLUE$C_BOLD" "$C_RESET" "$*" >&2; }
@@ -374,6 +385,26 @@ node_modules_root() {
   return 1
 }
 
+# The nearest ignore file at or above the project, bounded by the Drupal root.
+#
+# ESLint 8 only reads `.eslintignore` from the working directory, so linting
+# anything inside core would otherwise ignore core/.eslintignore and report
+# thousands of violations in vendored assets, jquery.form.js and build output.
+find_ignore_file() {
+  local name=$1
+  local dir=$QA_PROJECT_ROOT
+  local stop=${QA_DRUPAL_ROOT:-${QA_GIT_ROOT:-/}}
+  while [[ -n "$dir" && "$dir" != "/" ]]; do
+    [[ -f "$dir/$name" ]] && { printf '%s' "$dir/$name"; return 0; }
+    [[ "$dir" == "$stop" ]] && break
+    dir=$(dirname "$dir")
+  done
+  # Core keeps its own one level below the Drupal root.
+  [[ -n "${QA_DRUPAL_ROOT:-}" && -f "$QA_DRUPAL_ROOT/core/$name" && "$QA_PROJECT_ROOT" == "$QA_DRUPAL_ROOT/core"* ]] \
+    && { printf '%s' "$QA_DRUPAL_ROOT/core/$name"; return 0; }
+  return 1
+}
+
 # Major version of an ESLint binary. ESLint 8 reads .eslintrc files; ESLint 9
 # reads flat config and rejects most of the v8 command-line flags outright, so
 # the two cannot be driven the same way.
@@ -394,6 +425,33 @@ eslint_base_at_least() {
     [[ "$major" -ge "$want" ]] && { printf '%s' "$base"; return 0; }
   done
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# Running tools directly
+#
+# The wrapper is a convenience, not a cage. `drupal-qa exec` hands you the same
+# environment it would have used itself — the PHP version detected for this
+# project, the right copies of the tools on PATH — and then gets out of the way.
+# That is the difference between "phpcs" meaning the pinned one with Drupal and
+# DrupalPractice registered, and it meaning whatever global Composer install
+# happens to be first on your PATH.
+# ---------------------------------------------------------------------------
+
+# The PATH additions that make the QA tools directly callable, in the same
+# precedence order the wrapper itself uses.
+qa_tool_path() {
+  local parts="" vendor
+  if [[ "${QA_TOOLCHAIN:-auto}" != "pinned" && -n "${QA_COMPOSER_BIN_DIR:-}" ]]; then
+    parts="$QA_COMPOSER_BIN_DIR"
+  fi
+  if vendor=$(php_toolbox_vendor); then
+    parts="${parts:+$parts:}$vendor/bin"
+  fi
+  if [[ -n "${DRUPAL_QA_NODE_TOOLBOX:-}" ]]; then
+    parts="${parts:+$parts:}$DRUPAL_QA_NODE_TOOLBOX/node_modules/.bin"
+  fi
+  printf '%s' "$parts"
 }
 
 # ---------------------------------------------------------------------------

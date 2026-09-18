@@ -64,7 +64,8 @@ tool_composer_lint() {
   # CI validates without the lock file, because a contrib module's lock is not
   # what gets installed downstream. Mirror that, without touching the user's
   # working tree.
-  local status=pass args=(validate --no-interaction --ansi)
+  local status=pass
+  local -a args=(validate --no-interaction "$(color_args --ansi --no-ansi)")
   [[ -f "$QA_PROJECT_ROOT/composer.lock" ]] && args+=(--no-check-lock)
   [[ "$QA_PROJECT_TYPE" != "site" ]] && args+=(--no-check-publish)
 
@@ -78,7 +79,8 @@ tool_composer_lint() {
 
 phpcs_common_args() {
   local config=$1
-  QA_PHPCS_ARGS=(--standard="$config" --basepath="$QA_PROJECT_ROOT" -s --colors --report-width=120)
+  QA_PHPCS_ARGS=(--standard="$config" --basepath="$QA_PROJECT_ROOT" -s --report-width=120)
+  QA_PHPCS_ARGS+=("$(color_args --colors --no-colors)")
   local paths
   if paths=$(phpcs_standards_paths); then
     QA_PHPCS_ARGS+=(--runtime-set installed_paths "$paths")
@@ -95,7 +97,8 @@ tool_phpcs() {
   local list; list=$(target_paths_for "$PHP_EXTS|yml")
   read_paths "$list" || { record_result phpcs skip "no changed PHP files"; return 0; }
 
-  local config; config=$(config_phpcs)
+  resolve_config config_phpcs
+  local config=$QA_CONFIG_FILE
   announce "phpcs" "$config"
 
   phpcs_common_args "$config"
@@ -106,13 +109,38 @@ tool_phpcs() {
     *)      QA_PHPCS_ARGS+=(--report-full --report-summary --report-source) ;;
   esac
 
+  # Capture the report so the error/warning split can be shown. PHPCS exits
+  # non-zero for warnings alone, and whether a run has errors or only warnings
+  # is what decides if it blocks anything: Drupal's CI marks the phpcs job
+  # allow_failure by default, so warnings are reported without stopping the
+  # pipeline — but a project that sets _PHPCS_ALLOW_FAILURE: '0' makes a single
+  # warning blocking.
+  local out; out=$(mktemp)
   local status=pass
-  php_run "$bin" "${QA_PHPCS_ARGS[@]}" "${QA_PATHS[@]}" || status=fail
+  php_run "$bin" "${QA_PHPCS_ARGS[@]}" "${QA_PATHS[@]}" > >(tee "$out" >&2) 2>&1 || status=fail
+  wait
+
+  local counts errors warnings note=""
+  counts=$(sed -r 's/\x1B\[[0-9;]*[mK]//g' "$out" \
+    | grep -oE 'A TOTAL OF [0-9]+ ERRORS? AND [0-9]+ WARNINGS?' | head -1)
+  if [[ -n "$counts" ]]; then
+    errors=$(grep -oE '[0-9]+' <<< "$counts" | head -1)
+    warnings=$(grep -oE '[0-9]+' <<< "$counts" | tail -1)
+    note="$errors error(s), $warnings warning(s)"
+  fi
+  rm -f "$out"
+
   if [[ "$status" == fail ]]; then
     log ""
-    log "  ${C_DIM}Most of these are auto-fixable: ${C_RESET}${C_CYAN}drupal-qa fix ${QA_TARGET_ARG:-.}${C_RESET}"
+    if [[ "${errors:-1}" == "0" ]]; then
+      log "  ${C_DIM}Warnings only. Drupal's CI runs the phpcs job with allow_failure by default,${C_RESET}"
+      log "  ${C_DIM}so these are reported but do not block the pipeline unless the project sets${C_RESET}"
+      log "  ${C_DIM}_PHPCS_ALLOW_FAILURE: '0'. Check with:${C_RESET} ${C_CYAN}drupal-qa ci --list${C_RESET}"
+    else
+      log "  ${C_DIM}Most of these are auto-fixable: ${C_RESET}${C_CYAN}drupal-qa fix ${QA_TARGET_ARG:-.}${C_RESET}"
+    fi
   fi
-  record_result phpcs "$status"
+  record_result phpcs "$status" "$note"
 }
 
 tool_phpcbf() {
@@ -122,17 +150,44 @@ tool_phpcbf() {
   local list; list=$(target_paths_for "$PHP_EXTS|yml")
   read_paths "$list" || { record_result phpcbf skip "no changed PHP files"; return 0; }
 
-  local config; config=$(config_phpcs)
+  resolve_config config_phpcs
+  local config=$QA_CONFIG_FILE
   announce "phpcbf (fixing)" "$config"
 
   phpcs_common_args "$config"
+
+  # Capture the report so the REMAINING column can be read back. "phpcbf did not
+  # fix it" is nearly always PHPCS declining to: only messages it marks [x] are
+  # auto-fixable, and rewrapping a long line or removing a dpm() call needs a
+  # person. Saying so here saves the investigation.
+  local out; out=$(mktemp)
+  local rc=0
+  php_run "$bin" "${QA_PHPCS_ARGS[@]}" "${QA_PATHS[@]}" > >(tee "$out" >&2) 2>&1 || rc=$?
+  wait
+
+  local fixed remaining
+  fixed=$(grep -oE 'A TOTAL OF [0-9]+ ERRORS? WERE FIXED' "$out" | grep -oE '[0-9]+' | head -1)
+  # Per-file rows end in two numbers: fixed, then remaining.
+  remaining=$(sed -r 's/\x1B\[[0-9;]*[mK]//g' "$out" \
+    | grep -oE '[0-9]+[[:space:]]+[0-9]+[[:space:]]*$' \
+    | awk '{ total += $2 } END { print total + 0 }')
+  rm -f "$out"
+
   # phpcbf exits 1 when it fixed something and 2 on error, which is the opposite
   # of what a caller expects. Translate.
-  local rc=0
-  php_run "$bin" "${QA_PHPCS_ARGS[@]}" "${QA_PATHS[@]}" || rc=$?
+  local note=""
+  [[ -n "$fixed" && "$fixed" != "0" ]] && note="fixed $fixed"
+  if [[ -n "$remaining" && "$remaining" != "0" ]]; then
+    note="${note:+$note, }$remaining not auto-fixable"
+    log ""
+    log "  ${C_DIM}$remaining issue(s) cannot be fixed automatically — PHPCS only fixes what it marks${C_RESET}"
+    log "  ${C_DIM}[x] in its report. Line length, discouraged functions and missing descriptions${C_RESET}"
+    log "  ${C_DIM}need a person. See them with:${C_RESET} ${C_CYAN}drupal-qa phpcs ${QA_TARGET_ARG:-.}${C_RESET}"
+  fi
+
   case $rc in
-    0) record_result phpcbf pass "nothing to fix" ;;
-    1) record_result phpcbf pass "fixed some files" ;;
+    0) record_result phpcbf pass "${note:-nothing to fix}" ;;
+    1) record_result phpcbf pass "${note:-fixed some files}" ;;
     *) record_result phpcbf fail "exit $rc" ;;
   esac
 }
@@ -148,7 +203,8 @@ tool_phpstan() {
   local list; list=$(target_paths_for "$PHP_EXTS")
   read_paths "$list" || { record_result phpstan skip "no changed PHP files"; return 0; }
 
-  local config; config=$(config_phpstan)
+  resolve_config config_phpstan
+  local config=$QA_CONFIG_FILE
   announce "phpstan" "$config"
 
   if [[ -z "${QA_DRUPAL_ROOT:-}" ]]; then
@@ -158,6 +214,7 @@ tool_phpstan() {
   fi
 
   local -a args=(analyse --configuration="$config" --no-progress)
+  args+=("$(color_args --ansi --no-ansi)")
   [[ -n "${QA_PHPSTAN_LEVEL:-}" ]] && args+=(--level="$QA_PHPSTAN_LEVEL")
   # Drupal's own autoloader is what makes phpstan-drupal useful; without it every
   # service and entity class is unknown.
@@ -196,7 +253,8 @@ tool_cspell() {
     globs=("$QA_TARGET_PATH/**")
   fi
 
-  local config; config=$(config_cspell)
+  resolve_config config_cspell
+  local config=$QA_CONFIG_FILE
   announce "cspell" "$config"
 
   # --no-config-search is essential, not tidiness. Without it CSpell keeps
@@ -207,6 +265,7 @@ tool_cspell() {
   # module to be skipped, and the job reports success having checked nothing.
   local -a args=(-c "$config" --no-config-search --show-suggestions --show-context
                  --no-progress --cache --cache-location "$(cache_dir)/cspell.cache")
+  args+=("$(color_args --color --no-color)")
   [[ "${QA_VERBOSE:-0}" == "1" ]] || args+=(--no-must-find-files)
   [[ -n "${QA_EXTRA_CSPELL:-}" ]] && read -ra extra <<< "$QA_EXTRA_CSPELL" && args+=("${extra[@]}")
 
@@ -237,41 +296,142 @@ tool_cspell() {
 # Append every unrecognised word to the project dictionary. This is the same
 # artifact the CI job produces, but written straight into the repo where it
 # belongs.
-cspell_accept_words() {
-  local bin; bin=$(node_tool cspell) || die "cspell unavailable"
-  local config; config=$(config_cspell)
-  local words="$QA_PROJECT_ROOT/.cspell-project-words.txt"
-  local tmp; tmp=$(mktemp)
-
-  ( cd "$QA_PROJECT_ROOT" && "$bin" -c "$config" --words-only --unique --no-progress "$QA_TARGET_PATH/**" ) \
-    2>/dev/null | tr '[:upper:]' '[:lower:]' > "$tmp" || true
-
-  if [[ ! -s "$tmp" ]]; then
-    info "No unrecognised words to add."
-    rm -f "$tmp"
+# Where the project keeps its accepted words.
+#
+# Drupal's CI templates default to .cspell-project-words.txt and let a project
+# override it with the _CSPELL_DICTIONARY variable, so a project may legitimately
+# use another name. Honour an explicit --dictionary, then any .txt dictionary the
+# project's own CSpell config declares, then the Drupal default.
+cspell_dictionary_path() {
+  if [[ -n "${QA_CSPELL_DICTIONARY:-}" ]]; then
+    case "$QA_CSPELL_DICTIONARY" in
+      /*) printf '%s' "$QA_CSPELL_DICTIONARY" ;;
+      *)  printf '%s/%s' "$QA_PROJECT_ROOT" "$QA_CSPELL_DICTIONARY" ;;
+    esac
     return 0
   fi
 
-  # Keep any leading comment block where the author put it; sorting the whole
-  # file would shuffle the explanation into the middle of the word list.
-  local header="" body=""
-  if [[ -f "$words" ]]; then
-    header=$(sed -n '/^[^#]/q;p' "$words")
-    body=$(grep -v '^#' "$words" | grep -v '^[[:space:]]*$' || true)
+  local cfg declared
+  for cfg in "$QA_PROJECT_ROOT/.cspell.json" "$QA_PROJECT_ROOT/cspell.json" "$QA_PROJECT_ROOT/cspell.config.json"; do
+    [[ -f "$cfg" ]] || continue
+    declared=$(jq -r '[.dictionaryDefinitions[]? | select(.path | test("\\.txt$")) | .path] | first // empty' "$cfg" 2>/dev/null)
+    if [[ -n "$declared" ]]; then
+      # Declared paths are relative to the config file.
+      case "$declared" in
+        /*) printf '%s' "$declared" ;;
+        *)  printf '%s/%s' "$QA_PROJECT_ROOT" "${declared#./}" ;;
+      esac
+      return 0
+    fi
+  done
+
+  printf '%s/.cspell-project-words.txt' "$QA_PROJECT_ROOT"
+}
+
+# Collect the words CSpell does not recognise, lower-cased and deduplicated.
+cspell_unknown_words() {
+  local bin=$1 config=$2
+  shift 2
+  ( cd "$QA_PROJECT_ROOT" \
+      && "$bin" -c "$config" --no-config-search --words-only --unique --no-progress "$@" ) \
+    2>/dev/null | tr '[:upper:]' '[:lower:]' | LC_ALL=C sort -u
+}
+
+# Add every unrecognised word to the project dictionary.
+#
+# This is the same list the CI job publishes as _cspell_updated_project_words.txt,
+# written straight into the repository where it belongs. It is deliberately a
+# separate command rather than part of `drupal-qa fix`: accepting a word is
+# asserting that it is not a typo, and a fixer that silently blesses "recieve"
+# is worse than no spell check at all. --dry-run shows the list first.
+cspell_accept_words() {
+  local bin; bin=$(node_tool cspell) || die "cspell unavailable"
+  resolve_config config_cspell
+  local config=$QA_CONFIG_FILE
+  local words; words=$(cspell_dictionary_path)
+
+  local -a globs
+  if [[ "${QA_CHANGED:-0}" == "1" ]]; then
+    local list; list=$(changed_files)
+    if ! read_paths "$list"; then
+      info "No changed files to check."
+      return 0
+    fi
+    globs=("${QA_PATHS[@]}")
+  else
+    globs=("$QA_TARGET_PATH/**")
   fi
 
-  local before=0
-  [[ -n "$body" ]] && before=$(wc -l <<< "$body")
+  local new_words; new_words=$(cspell_unknown_words "$bin" "$config" "${globs[@]}")
+  if [[ -z "$new_words" ]]; then
+    info "No unrecognised words to add."
+    return 0
+  fi
+
+  # Only report words that are not already accepted, so the count means
+  # something on a second run.
+  local existing="" added
+  if [[ -f "$words" ]]; then
+    existing=$(grep -v '^[[:space:]]*#' "$words" | grep -v '^[[:space:]]*$' | tr '[:upper:]' '[:lower:]' | LC_ALL=C sort -u)
+  fi
+  added=$(LC_ALL=C comm -23 <(printf '%s\n' "$new_words") <(printf '%s\n' "$existing"))
+
+  if [[ -z "$added" ]]; then
+    info "Nothing new: all $(wc -l <<< "$new_words") reported word(s) are already in ${words/#$QA_PROJECT_ROOT\//}."
+    return 0
+  fi
+
+  printf '\n%sWords to accept%s (%d)\n' "$C_BOLD" "$C_RESET" "$(wc -l <<< "$added")" >&2
+  # One word per line, indented; the list is newline-separated already.
+  local word
+  while IFS= read -r word; do
+    printf '  %s\n' "$word" >&2
+  done <<< "$added"
+  printf '\n' >&2
+
+  if [[ "${QA_DRY_RUN:-0}" == "1" ]]; then
+    info "Dry run. Add them with: drupal-qa cspell ${QA_TARGET_ARG:-.} --accept-words"
+    return 0
+  fi
+
+  # Preserve any leading comment block; sorting the whole file would shuffle the
+  # explanation into the middle of the word list.
+  local header=""
+  if [[ -f "$words" ]]; then
+    header=$(sed -n '/^[^#]/q;p' "$words")
+  else
+    header="# Words that are correct in this project but not in any standard dictionary.
+# One per line, lower case. Add more with: drupal-qa cspell --accept-words"
+  fi
 
   {
     [[ -n "$header" ]] && printf '%s\n' "$header"
-    { [[ -n "$body" ]] && printf '%s\n' "$body"; cat "$tmp"; } | LC_ALL=C sort -u
+    { [[ -n "$existing" ]] && printf '%s\n' "$existing"; printf '%s\n' "$added"; } | LC_ALL=C sort -u
   } > "$words.new"
   mv "$words.new" "$words"
-  rm -f "$tmp"
 
-  local after; after=$(grep -cv '^#' "$words")
-  info "Added $((after - before)) word(s) to ${words/#$QA_PROJECT_ROOT\//}. Review it before committing."
+  info "Added $(wc -l <<< "$added") word(s) to ${words/#$QA_PROJECT_ROOT\//}. Review it before committing."
+
+  # Verify the dictionary is actually loaded. A project whose own .cspell.json
+  # does not declare this file will keep reporting the same words for ever, and
+  # silently writing to a file nothing reads is the most confusing possible
+  # outcome.
+  #
+  # Re-resolve the config first: the generated overlay only wires in the
+  # dictionary when the file exists, and a moment ago it did not.
+  resolve_config config_cspell
+  local recheck_config=$QA_CONFIG_FILE
+  local still; still=$(cspell_unknown_words "$bin" "$recheck_config" "${globs[@]}")
+  [[ -z "$still" ]] && return 0
+
+  warn "CSpell still reports $(wc -l <<< "$still") word(s) after the update."
+  if [[ "$QA_CONFIG_ORIGIN" == project* ]]; then
+    warn "This project's own CSpell config does not load ${words##*/}. Add to $recheck_config:"
+    log '    "dictionaryDefinitions": [{ "name": "project-words", "path": "./'"${words##*/}"'", "addWords": true }],'
+    log '    "dictionaries": ["project-words"]'
+  else
+    warn "Those words may contain characters CSpell splits differently; check them by hand."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -289,8 +449,7 @@ tool_eslint() {
   # It must be called with stdout redirected rather than in $(...), or the
   # variables it sets would be trapped in the subshell and the v8 flags would be
   # used against a v9 binary.
-  QA_CONFIG_FILE=""
-  config_eslint > /dev/null
+  resolve_config config_eslint
   local config=$QA_CONFIG_FILE
   local bin=${QA_ESLINT_BIN:-}
   [[ -n "$bin" ]] || bin=$(node_tool eslint) || { record_result eslint skip "eslint unavailable"; return 0; }
@@ -298,6 +457,7 @@ tool_eslint() {
   announce "eslint" "$config"
 
   local -a args=(--no-error-on-unmatched-pattern)
+  args+=("$(color_args --color --no-color)")
   args+=(--config "$config")
   args+=(--cache --cache-location "$(cache_dir)/eslint.cache")
 
@@ -308,12 +468,17 @@ tool_eslint() {
   else
     # shellcheck disable=SC2054  # --ext takes a comma-separated list; one argument.
     args+=(--ignore-pattern='*.es6.js' --ext=.js,.yml)
+    # Flat config carries its own ignores; only eslintrc needs this.
+    local ignore_file
+    ignore_file=$(find_ignore_file .eslintignore) && args+=(--ignore-path "$ignore_file")
     [[ -n "${QA_ESLINT_BASE:-}" ]] && args+=(--resolve-plugins-relative-to "$QA_ESLINT_BASE")
-    # --config does not switch off the cascade. Linting core/modules/node would
-    # otherwise also pick up core/.eslintrc.json, whose `extends: airbnb-base`
-    # cannot resolve unless core's node_modules is installed, so the run dies on
-    # a config error instead of reporting anything.
-    [[ "$QA_CONFIG_ORIGIN" != project* ]] && args+=(--no-eslintrc)
+    # --config does not switch off the cascade, and the cascade is never what we
+    # want here. Drupal scaffolds web/.eslintrc.json into every site, extending
+    # core/.eslintrc.json — so linting any module would also pull that in, and
+    # its `extends: airbnb-base` cannot resolve unless core's node_modules is
+    # installed. The overlay already layers core and the project explicitly, so
+    # nothing is lost by taking the cascade out of the picture.
+    args+=(--no-eslintrc)
   fi
 
   [[ "${QA_FIX:-0}" == "1" ]] && args+=(--fix)
@@ -345,10 +510,12 @@ tool_stylelint() {
     globs=("$QA_TARGET_PATH/**/*.css")
   fi
 
-  local config; config=$(config_stylelint)
+  resolve_config config_stylelint
+  local config=$QA_CONFIG_FILE
   announce "stylelint" "$config"
 
-  local -a args=(--formatter verbose --color --allow-empty-input)
+  local -a args=(--formatter verbose --allow-empty-input)
+  args+=("$(color_args --color --no-color)")
   args+=(--config "$config")
   # `extends` entries resolve relative to --config-basedir. The overlay sits in
   # the cache directory, which has no node_modules of its own, so point this at
@@ -381,7 +548,8 @@ tool_prettier() {
     globs=("$QA_TARGET_PATH/**/*.{js,css}")
   fi
 
-  local config; config=$(config_prettier)
+  resolve_config config_prettier
+  local config=$QA_CONFIG_FILE
   announce "prettier" "$config"
 
   local -a args=(--config "$config" --ignore-unknown --no-error-on-unmatched-pattern)
@@ -403,10 +571,11 @@ tool_twig() {
   local list; list=$(target_paths_for "$TWIG_EXTS")
   read_paths "$list" || { record_result twig skip "no changed Twig files"; return 0; }
 
-  local config; config=$(config_twig)
+  resolve_config config_twig
+  local config=$QA_CONFIG_FILE
   announce "twig-cs-fixer" "$config"
 
-  local -a args=(lint -c "$config")
+  local -a args=(lint -c "$config" "$(color_args --ansi --no-ansi)")
   [[ "${QA_FIX:-0}" == "1" ]] && args+=(--fix)
   [[ "${QA_FORMAT:-pretty}" == "gitlab" ]] && args+=(--report=gitlab)
   [[ -n "${QA_EXTRA_TWIG:-}" ]] && read -ra extra <<< "$QA_EXTRA_TWIG" && args+=("${extra[@]}")

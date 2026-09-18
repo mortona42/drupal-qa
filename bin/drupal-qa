@@ -21,7 +21,11 @@ set -uo pipefail
 # --no-color has to be honoured here rather than during normal option parsing.
 for _arg in "$@"; do
   case $_arg in
-    --no-color|--no-colour) DRUPAL_QA_COLOR=never ;;
+    --no-color|--no-colour)   DRUPAL_QA_COLOR=never ;;
+    # Colour is off when output is not a terminal, which is right for a pipe
+    # into grep but wrong for one into `less -R`.
+    --color|--colour|--color=always|--colour=always) DRUPAL_QA_COLOR=always ;;
+    --color=never|--colour=never) DRUPAL_QA_COLOR=never ;;
   esac
 done
 unset _arg
@@ -65,6 +69,9 @@ ${C_BOLD}CHECKING${C_RESET}
   phpcs / phpcbf          Drupal coding standards
   phpstan                 Static analysis, Drupal-aware
   cspell                  Spell check, using core's dictionaries
+  cspell --accept-words   Add every unrecognised word to the project dictionary
+                          (add --dry-run first, and --changed to limit it to
+                          files you touched)
   eslint / stylelint      JavaScript, YAML and CSS
   prettier                Formatting
   twig                    Twig CS Fixer
@@ -85,6 +92,13 @@ ${C_BOLD}SETUP${C_RESET}
   baseline [target]       Accept today's PHPStan errors, fail only on new ones
   info [target]           Show everything that was detected, and why
   doctor                  Check the environment and report what is missing
+
+${C_BOLD}RUNNING THE TOOLS YOURSELF${C_RESET}
+  exec <cmd> [args...]    Run any command with this project's PHP version and
+                          the right copies of the tools on PATH
+  env                     Print those settings as shell exports; apply with
+                          eval "$(drupal-qa env)"
+  ${C_DIM}Any check also accepts -v, which prints the exact command it ran.${C_RESET}
 
 ${C_BOLD}COMMON OPTIONS${C_RESET}
   --changed[=<ref>]       Only files changed since <ref> (default: merge-base
@@ -110,7 +124,8 @@ ${C_BOLD}COMMON OPTIONS${C_RESET}
   -v, --verbose           Show the exact command behind every tool
   --show-commands         Show commands without the rest of the verbose output
   -q, --quiet             Suppress the per-command echo
-  --no-color              Disable colour
+  --no-color              Disable colour, in this tool and the ones it runs
+  --color                 Force colour on even when piping (e.g. into less -R)
 
 ${C_BOLD}TEST OPTIONS${C_RESET}
   --type=<list>           unit,kernel,functional,functional-js,build
@@ -143,6 +158,9 @@ ${C_BOLD}EXAMPLES${C_RESET}
   drupal-qa test my_module --type=functional-js --ddev
   drupal-qa ci phpcs                      ${C_DIM}# the actual CI job, in its container${C_RESET}
   drupal-qa init my_module --with=phpcs,phpstan,gitlab-ci
+  drupal-qa exec phpcs --standard=Drupal src/     ${C_DIM}# the pinned phpcs, project PHP${C_RESET}
+  drupal-qa exec phpstan --version
+  drupal-qa phpcs my_module -v                    ${C_DIM}# show the command, then run it yourself${C_RESET}
 EOF
 }
 
@@ -161,13 +179,22 @@ parse_args() {
   local -a rest=()
   while [[ $# -gt 0 ]]; do
     local arg=$1
+    # After `exec`, our own flags may still appear (drupal-qa exec --php=8.5
+    # phpcs ...), but the first bare word starts the command being run and
+    # everything from there belongs to it — `drupal-qa exec phpcs --version`
+    # must print PHPCS's version, not ours. Use `--` to force the split when the
+    # command itself begins with a dash.
+    if [[ ${#rest[@]} -gt 0 && "${rest[0]}" == "exec" && "$arg" != -* ]]; then
+      QA_PASSTHROUGH+=("$@")
+      break
+    fi
     case $arg in
       -h|--help)        usage; exit 0 ;;
       -V|--version)     printf 'drupal-qa %s\n' "$QA_VERSION"; exit 0 ;;
       -v|--verbose)     QA_VERBOSE=1 ;;
       -q|--quiet)       QA_SHOW_COMMANDS=0; QA_VERBOSE=0 ;;
       --show-commands)  QA_SHOW_COMMANDS=1 ;;
-      --no-color|--no-colour) ;;  # handled before the libraries were sourced
+      --no-color|--no-colour|--color|--colour|--color=*|--colour=*) ;;  # handled before the libraries were sourced
       --fix)            QA_FIX=1 ;;
       --force)          QA_FORCE=1 ;;
       --keep)           QA_KEEP_ARTIFACTS=1 ;;
@@ -178,6 +205,8 @@ parse_args() {
       --deprecations)   QA_SHOW_DEPRECATIONS=1 ;;
       --deprecations=*) QA_SHOW_DEPRECATIONS=$([[ "${arg#*=}" == "show" ]] && echo 1 || echo 0) ;;
       --accept-words)   QA_ACCEPT_WORDS=1 ;;
+      --dry-run|-n)     QA_DRY_RUN=1 ;;
+      --dictionary=*)   QA_CSPELL_DICTIONARY=${arg#*=} ;;
       --gitlab-ci)      QA_INIT_WHAT+=(gitlab-ci) ;;
       --offline)        QA_OFFLINE=1 ;;
       --dirty)          QA_CI_DIRTY=1 ;;
@@ -353,8 +382,7 @@ cmd_info() {
   local label fn
   for label in phpcs phpstan cspell eslint stylelint prettier twig; do
     fn="config_${label}"
-    QA_CONFIG_ORIGIN=""; QA_CONFIG_FILE=""
-    "$fn" > /dev/null
+    resolve_config "$fn"
     if [[ "${QA_VERBOSE:-0}" == "1" ]]; then
       row "$label" "$QA_CONFIG_ORIGIN"
       printf '  %-22s %s%s%s\n' "" "$C_DIM" "$QA_CONFIG_FILE" "$C_RESET" >&2
@@ -505,6 +533,8 @@ main() {
       if [[ "${QA_LIST:-0}" == "1" ]]; then cmd_ci_list; exit $?; fi
       cmd_ci "${QA_PASSTHROUGH[@]}" ;;
 
+    exec|run)       cmd_exec "${QA_PASSTHROUGH[@]}" ;;
+    env)            cmd_env; exit 0 ;;
     init|setup)     cmd_init; exit $? ;;
     baseline)       cmd_baseline; exit $? ;;
     info|status)    cmd_info; exit 0 ;;
