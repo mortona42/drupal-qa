@@ -97,6 +97,11 @@ ${C_BOLD}COMMON OPTIONS${C_RESET}
                           require more
   --core=<path>           Drupal root, when it cannot be found automatically
   --config-source=<src>   auto (default) | project | core | bundled
+  --toolchain=<src>       auto (default) | project | pinned. Which copies of the
+                          tools to run: the site's vendor/bin, or this flake's
+                          pinned ones
+  --isolated              --toolchain=pinned --config-source=bundled, so the
+                          same module gives the same answer under any site
   --level=<n>             PHPStan level override
   --format=<fmt>          pretty (default) | junit | gitlab | json
   --report-dir=<path>     Where machine-readable reports are written
@@ -188,6 +193,10 @@ parse_args() {
       --core=*)         QA_CORE_OVERRIDE=${arg#*=} ;;
       --core)           shift; QA_CORE_OVERRIDE=$1 ;;
       --config-source=*) QA_CONFIG_SOURCE=${arg#*=} ;;
+      --toolchain=*)    QA_TOOLCHAIN=${arg#*=} ;;
+      # Same answer wherever the module is checked out: pinned tools, bundled
+      # configs, nothing borrowed from the surrounding site.
+      --isolated)       QA_TOOLCHAIN=pinned; QA_CONFIG_SOURCE=bundled ;;
       --level=*)        QA_PHPSTAN_LEVEL=${arg#*=} ;;
       --format=*)       QA_FORMAT=${arg#*=} ;;
       --report-dir=*)   QA_REPORT_DIR=${arg#*=} ;;
@@ -312,6 +321,31 @@ cmd_info() {
   row "CSS files" "$(has_files_with_ext "$CSS_EXTS" && echo yes || echo no)"
   row "Twig files" "$(has_files_with_ext "$TWIG_EXTS" && echo yes || echo no)"
   row "tests/" "$([[ -d "$QA_PROJECT_ROOT/tests" ]] && echo yes || echo no)"
+
+  printf '\n%sToolchain%s\n' "$C_BOLD" "$C_RESET" >&2
+  local t bin version origin
+  for t in phpcs phpstan twig-cs-fixer parallel-lint; do
+    if bin=$(php_tool "$t" 2>/dev/null); then
+      version=$(php_tool_version "$bin" || echo '?')
+      origin=$(tool_origin "$bin")
+      row "$t" "$version  ($origin)"
+    else
+      row "$t" "not available"
+    fi
+  done
+  for t in eslint stylelint prettier cspell; do
+    if bin=$(node_tool "$t" 2>/dev/null); then
+      version=$(node_tool_version "$bin" || echo '?')
+      origin=$(tool_origin "$bin")
+      row "$t" "$version  ($origin)"
+    else
+      row "$t" "not available"
+    fi
+  done
+  if [[ -n "${QA_COMPOSER_BIN_DIR:-}" ]]; then
+    printf '  %sTools marked (project) come from this site, so the same module can\n' "$C_DIM" >&2
+    printf '  lint differently under a different site. Use --isolated to pin them.%s\n' "$C_RESET" >&2
+  fi
 
   printf '\n%sConfiguration that will be used%s\n' "$C_BOLD" "$C_RESET" >&2
   # Called with stdout redirected rather than in $(...), so that the provenance

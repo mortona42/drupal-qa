@@ -45,6 +45,11 @@ php.buildComposerProject2 {
     EOF
     # The heredoc above is indented for readability; strip it back out.
     sed -i 's/^    //' "$conf"
+
+    # phpstan/extension-installer is a Composer plugin and so is equally inert
+    # here. Without its generated config PHPStan silently ignores
+    # mglaman/phpstan-drupal and reports every Drupal class as "not found".
+    ${php}/bin/php ${./generate-phpstan-extensions.php} "$vendorDir"
   '';
 
   meta = {

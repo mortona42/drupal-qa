@@ -268,20 +268,60 @@ php_toolbox_vendor() {
   return 1
 }
 
-# Resolve a PHP QA binary, preferring the project's own vendor/bin when the
-# project deliberately pins its own version (a module requiring a specific
-# phpstan should get that phpstan), otherwise the pinned toolbox.
+# Resolve a PHP QA binary.
+#
+# The default prefers the project's own vendor/bin, because those are the
+# versions its core-dev pins and therefore the ones its pipeline will run. The
+# consequence is that the same contrib module checked out under two different
+# sites is linted by two different toolchains — Drupal 12's drupal/coder 9 finds
+# things Drupal 11's 8.3 does not. That is correct, but it is only reasonable
+# behaviour if you can see it and turn it off, hence --toolchain and the
+# Toolchain section of `drupal-qa info`.
+#
+#   auto    (default) project's vendor/bin, else the pinned toolbox
+#   project only the project's vendor/bin
+#   pinned  only the flake's pinned toolbox — identical results anywhere
 php_tool() {
   local name=$1 vendor
-  if [[ "${QA_PREFER_PROJECT_TOOLS:-auto}" != "never" && -n "${QA_COMPOSER_BIN_DIR:-}" && -x "$QA_COMPOSER_BIN_DIR/$name" ]]; then
+  local mode=${QA_TOOLCHAIN:-auto}
+
+  if [[ "$mode" != "pinned" && -n "${QA_COMPOSER_BIN_DIR:-}" && -x "$QA_COMPOSER_BIN_DIR/$name" ]]; then
     debug "using project $name from $QA_COMPOSER_BIN_DIR"
     printf '%s' "$QA_COMPOSER_BIN_DIR/$name"; return 0
   fi
+  [[ "$mode" == "project" ]] && return 1
+
   if vendor=$(php_toolbox_vendor) && [[ -f "$vendor/bin/$name" ]]; then
     printf '%s' "$vendor/bin/$name"; return 0
   fi
   command -v "$name" 2>/dev/null && return 0
   return 1
+}
+
+# Version string for a PHP QA binary, for `drupal-qa info`. Tools disagree about
+# how to print it, so take the first version-looking token off the first line.
+php_tool_version() {
+  local bin=$1 out
+  out=$("$(resolve_php)" "$bin" --version 2>/dev/null | head -1) || return 1
+  grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' <<< "$out" | head -1
+}
+
+node_tool_version() {
+  local bin=$1 out
+  out=$("$bin" --version 2>/dev/null | head -1) || return 1
+  grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' <<< "$out" | head -1
+}
+
+# Where a resolved binary came from, in one word.
+tool_origin() {
+  local bin=$1
+  case $bin in
+    "${QA_COMPOSER_BIN_DIR:-__none__}"/*) printf 'project' ;;
+    "${DRUPAL_QA_PHP_TOOLBOX:-__none__}"/*|"${DRUPAL_QA_NODE_TOOLBOX:-__none__}"/*) printf 'pinned' ;;
+    "${QA_PROJECT_ROOT:-__none__}"/node_modules/*) printf 'project' ;;
+    "${QA_DRUPAL_ROOT:-__none__}"/core/node_modules/*) printf 'core' ;;
+    *) printf 'PATH' ;;
+  esac
 }
 
 # A binary sitting in node_modules/.bin is not proof that it runs. Core's
@@ -310,10 +350,17 @@ node_tool_in() {
 # someone ran `yarn install` in core, and preferring a possibly-stale tree over
 # a version-pinned one trades reproducibility for nothing.
 node_tool() {
-  local name=$1 bin
-  for base in "${QA_PROJECT_ROOT:-}" "${DRUPAL_QA_NODE_TOOLBOX:-}" "${QA_DRUPAL_ROOT:-}/core"; do
+  local name=$1 bin base
+  local -a bases
+  case "${QA_TOOLCHAIN:-auto}" in
+    pinned)  bases=("${DRUPAL_QA_NODE_TOOLBOX:-}") ;;
+    project) bases=("${QA_PROJECT_ROOT:-}" "${QA_DRUPAL_ROOT:-}/core") ;;
+    *)       bases=("${QA_PROJECT_ROOT:-}" "${DRUPAL_QA_NODE_TOOLBOX:-}" "${QA_DRUPAL_ROOT:-}/core") ;;
+  esac
+  for base in "${bases[@]}"; do
     bin=$(node_tool_in "$base" "$name") && { printf '%s' "$bin"; return 0; }
   done
+  [[ "${QA_TOOLCHAIN:-auto}" == "pinned" ]] && return 1
   command -v "$name" 2>/dev/null && return 0
   return 1
 }
@@ -340,6 +387,7 @@ eslint_major() {
 # The first base directory offering an ESLint of at least $1.
 eslint_base_at_least() {
   local want=$1 base bin major
+  [[ "${QA_TOOLCHAIN:-auto}" == "pinned" ]] && return 1
   for base in "${QA_PROJECT_ROOT:-}" "${QA_DRUPAL_ROOT:-}/core" "${DRUPAL_QA_NODE_TOOLBOX:-}"; do
     bin=$(node_tool_in "$base" eslint) || continue
     major=$(eslint_major "$bin") || continue

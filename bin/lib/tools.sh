@@ -199,17 +199,39 @@ tool_cspell() {
   local config; config=$(config_cspell)
   announce "cspell" "$config"
 
-  local -a args=(-c "$config" --show-suggestions --show-context --no-progress --cache --cache-location "$(cache_dir)/cspell.cache")
+  # --no-config-search is essential, not tidiness. Without it CSpell keeps
+  # walking up from each file and merging any .cspell.json it finds, so a
+  # contrib module checked out inside a site inherits that site's ignorePaths.
+  # A site that excludes web/modules/contrib from its own spell check — a
+  # perfectly reasonable thing to do — then silently causes every file in the
+  # module to be skipped, and the job reports success having checked nothing.
+  local -a args=(-c "$config" --no-config-search --show-suggestions --show-context
+                 --no-progress --cache --cache-location "$(cache_dir)/cspell.cache")
   [[ "${QA_VERBOSE:-0}" == "1" ]] || args+=(--no-must-find-files)
   [[ -n "${QA_EXTRA_CSPELL:-}" ]] && read -ra extra <<< "$QA_EXTRA_CSPELL" && args+=("${extra[@]}")
 
+  # Capture the output so the summary line can be inspected: "checked 0 files"
+  # is a far more dangerous result than "found 3 typos", because it looks
+  # exactly like success.
+  local out; out=$(mktemp)
   local status=pass
-  ( cd "$QA_PROJECT_ROOT" && run_cmd "$bin" "${args[@]}" "${globs[@]}" ) || status=fail
+  ( cd "$QA_PROJECT_ROOT" && run_cmd "$bin" "${args[@]}" "${globs[@]}" ) > >(tee "$out" >&2) 2>&1 || status=fail
+  wait
+
   if [[ "$status" == fail ]]; then
     log ""
     log "  ${C_DIM}Real jargon rather than a typo? Add it:${C_RESET} ${C_CYAN}drupal-qa cspell ${QA_TARGET_ARG:-.} --accept-words${C_RESET}"
+    record_result cspell fail
+  elif grep -qE 'Files checked: 0\b' "$out" && grep -qE 'skipped: [1-9]' "$out"; then
+    local skipped
+    skipped=$(grep -oE 'skipped: [0-9]+' "$out" | head -1 | grep -oE '[0-9]+')
+    warn "CSpell checked no files: all $skipped were excluded by its configuration."
+    warn "Check the ignorePaths in $config."
+    record_result cspell warn "0 checked, $skipped skipped"
+  else
+    record_result cspell pass
   fi
-  record_result cspell "$status"
+  rm -f "$out"
 }
 
 # Append every unrecognised word to the project dictionary. This is the same
@@ -328,8 +350,10 @@ tool_stylelint() {
 
   local -a args=(--formatter verbose --color --allow-empty-input)
   args+=(--config "$config")
-  # Shareable configs in the staged/core config resolve from its own directory.
-  args+=(--config-basedir "$(dirname "$config")")
+  # `extends` entries resolve relative to --config-basedir. The overlay sits in
+  # the cache directory, which has no node_modules of its own, so point this at
+  # whichever tree the real config came from.
+  args+=(--config-basedir "$(node_modules_root || dirname "$config")")
   args+=(--cache --cache-location "$(cache_dir)/stylelint.cache")
   [[ -f "$QA_PROJECT_ROOT/.stylelintignore" ]] && args+=(--ignore-path "$QA_PROJECT_ROOT/.stylelintignore")
   [[ "${QA_FIX:-0}" == "1" ]] && args+=(--fix)
@@ -394,8 +418,17 @@ tool_twig() {
     php_args+=(-d "auto_prepend_file=$QA_COMPOSER_ROOT/vendor/autoload.php")
   fi
 
+  # Twig CS Fixer's cache location is set *inside* the config file, and core's
+  # hard-codes the relative path './core/.twigcsfixercache'. Run from the cache
+  # directory so a relative path like that lands there instead of creating a
+  # stray core/ directory inside whatever module is being linted. The paths
+  # passed in are absolute, so the working directory is otherwise irrelevant.
+  local twig_cwd; twig_cwd=$(cache_dir)/twig
+  mkdir -p "$twig_cwd/core"
+
   local status=pass
-  DRUPAL_QA_TWIG_CACHE="$(cache_dir)/twig-cs-fixer.cache" \
-    php_run "${php_args[@]}" "$bin" "${args[@]}" "${QA_PATHS[@]}" || status=fail
+  ( cd "$twig_cwd" \
+      && DRUPAL_QA_TWIG_CACHE="$twig_cwd/twig-cs-fixer.cache" \
+         php_run "${php_args[@]}" "$bin" "${args[@]}" "${QA_PATHS[@]}" ) || status=fail
   record_result twig "$status"
 }
