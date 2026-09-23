@@ -1,3 +1,9 @@
+# Intro
+Drupal code qa/test tools implemented in nix.
+This is vibe coded with minimal review, be warned!
+However, it works well for me and is quite easy to use, and propbably won't break anything.
+___
+
 # drupal-nix-tools
 
 Run Drupal's CI code quality tools and tests locally, reproducibly, with nothing
