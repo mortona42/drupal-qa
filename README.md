@@ -4,6 +4,8 @@ Drupal code qa/test tools implemented in nix.
 This is vibe coded with minimal review, be warned!
 
 However, it works well for me and is quite easy to use, and propbably won't break anything.
+
+Recommended: Create an alias for drupal-qa as dq, and use frequently.
 ___
 
 # drupal-nix-tools
